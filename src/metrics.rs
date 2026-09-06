@@ -12,6 +12,7 @@ pub struct Metrics {
     pub requests_queued: AtomicI64,
     pub upstream_requests_total: AtomicU64,
     pub upstream_429_total: AtomicU64,
+    pub quota_exhaustion_total: AtomicU64,
     pub upstream_5xx_total: AtomicU64,
     pub upstream_transport_errors_total: AtomicU64,
     pub stream_interruptions_total: AtomicU64,
@@ -150,6 +151,12 @@ impl Metrics {
             "sensenova_proxy_upstream_429_total",
             "Upstream responses classified as rate limited.",
             self.upstream_429_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_quota_exhaustion_total",
+            "Upstream responses classified as explicit quota exhaustion.",
+            self.quota_exhaustion_total.load(Ordering::Relaxed),
             &mut output,
         );
         counter(

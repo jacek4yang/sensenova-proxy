@@ -786,6 +786,190 @@ async fn upstream_401_with_single_key_marks_gateway_not_ready() {
 }
 
 // ---------------------------------------------------------------------------
+// Tests: 429 classification vs quota exhaustion (production bug regression)
+// ---------------------------------------------------------------------------
+
+/// Scenario A/C (spec §32): a generic 429 — even with Google-style code 8
+/// (RESOURCE_EXHAUSTED) — is a PER-KEY rate limit. It must cool only that
+/// key, never the whole quota group, never open the quota circuit, and the
+/// same request must fail over to another credential in the SAME group.
+#[tokio::test]
+async fn generic_429_code8_is_per_key_and_never_cools_the_group() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![
+            Spec::json(
+                429,
+                r#"{"error":{"code":8,"message":"RESOURCE_EXHAUSTED"}}"#,
+            ),
+            Spec::json(200, ok_message_json()),
+        ],
+    )
+    .await;
+    mock.set(
+        "sensenova-key-2",
+        vec![
+            Spec::json(200, ok_message_json()),
+            Spec::json(200, ok_message_json()),
+        ],
+    )
+    .await;
+    // Both credentials share one quota group: the strongest proof that the
+    // group was NOT marked exhausted is that key-2 (same group) still serves.
+    let mut config = test_config(base, 2);
+    for key in &mut config.sensenova_api_keys {
+        key.quota_group = "account-a".into();
+    }
+    let state = AppState::new(config).unwrap();
+    let app = router(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "failover must succeed");
+
+    // Per-key cooldown, not group cooling, not quota circuit.
+    let snapshots = state.core.pool.snapshots();
+    assert!(snapshots[0].cooling_remaining.is_some(), "key-1 cools");
+    assert!(
+        snapshots[1].cooling_remaining.is_none(),
+        "key-2 (same group) must remain usable"
+    );
+    assert_eq!(
+        state.core.circuit.state(),
+        crate::circuit::CircuitState::Closed,
+        "generic 429 must not open the quota circuit"
+    );
+
+    // The request went to key-1 then failed over to key-2.
+    let authorizations: Vec<String> = mock
+        .seen()
+        .await
+        .into_iter()
+        .map(|request| request.authorization)
+        .collect();
+    assert_eq!(
+        authorizations,
+        vec![
+            "Bearer sensenova-key-1".to_string(),
+            "Bearer sensenova-key-2".to_string(),
+        ]
+    );
+
+    // Next request stays sticky on key-2.
+    let response = app
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    task.abort();
+}
+
+/// Scenario B (spec §32): explicit FREE_QUOTA_EXHAUSTED on one key cools the
+/// whole quota group (a same-group second key is skipped) while a different
+/// quota group remains usable — the global circuit must NOT block it.
+#[tokio::test]
+async fn explicit_quota_exhaustion_spares_other_groups() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(
+            429,
+            r#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#,
+        )],
+    )
+    .await;
+    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set("sensenova-key-3", vec![Spec::json(200, ok_message_json())])
+        .await;
+
+    let mut config = test_config(base, 3);
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-a".into();
+    config.sensenova_api_keys[2].quota_group = "account-b".into();
+    let state = AppState::new(config).unwrap();
+    let app = router(state.clone());
+
+    // First request hits key-1 (group A): explicit quota exhaustion cools
+    // group A and returns 429 without cross-group replay.
+    let first = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let snapshots = state.core.pool.snapshots();
+    assert!(snapshots[0].cooling_remaining.is_some(), "key-1 cools");
+    assert!(
+        snapshots[1].cooling_remaining.is_some(),
+        "key-2 (same group) is skipped via group cooldown"
+    );
+    assert!(
+        snapshots[2].cooling_remaining.is_none(),
+        "key-3 (group B) must remain usable"
+    );
+    assert_eq!(
+        state.core.circuit.state(),
+        crate::circuit::CircuitState::Closed,
+        "circuit must stay closed while another quota group is usable"
+    );
+
+    // Second request is served by group B.
+    let second = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let last_authorization = mock
+        .seen()
+        .await
+        .last()
+        .map(|request| request.authorization.clone())
+        .unwrap_or_default();
+    assert_eq!(last_authorization, "Bearer sensenova-key-3");
+    task.abort();
+}
+
+/// With a single quota group, explicit quota exhaustion still opens the
+/// global circuit (no other group exists to serve), and follow-up requests
+/// fail fast without dialing the upstream.
+#[tokio::test]
+async fn single_group_quota_exhaustion_still_opens_circuit() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![
+            Spec::json(429, r#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#),
+            Spec::json(200, ok_message_json()),
+        ],
+    )
+    .await;
+    let state = AppState::new(test_config(base, 1)).unwrap();
+    let app = router(state.clone());
+    let first = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+    let second = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The second request was refused locally: the upstream was dialed once.
+    assert_eq!(mock.seen().await.len(), 1);
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
 // Tests: transient failures, retries, and error fidelity
 // ---------------------------------------------------------------------------
 

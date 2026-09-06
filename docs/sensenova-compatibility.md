@@ -96,12 +96,35 @@ fallback is ever added; sensenova-proxy v1 does not use this path).
   requests took ~8 s while a second burst took ~1.2 s — evidence of **server-side
   queueing/serialization** under modest concurrency (observed). This motivates a
   conservative local concurrency limit.
-- 429/quota shapes: **not directly observed** (deliberately not provoked —
-  abusing the endpoint is out of scope). The proxy therefore classifies from
-  HTTP status + `Retry-After` + SenseNova's Google-style numeric `error.code`
-  envelope (seen for 401: `{"error":{"code":16,...}}`), with defensive fallbacks:
-  inference for quota exhaustion is marked as such in code comments and never
-  claimed as verified.
+- **Generic 429 observed in production** during real Claude Code usage: the
+  request received HTTP 429 while the Token Plan dashboard still showed
+  ~97.7 % of the 5-hour general credit pool remaining. The exact upstream 429
+  body was not retained in the earlier log. Consequence: **generic 429 cannot
+  be treated as proof of credit exhaustion.** Official semantics distinguish
+  the two: HTTP 429 = rate limiting (back off and retry);
+  `FREE_QUOTA_EXHAUSTED` = explicit plan-quota exhaustion.
+- Quota-exhaustion classification (updated after the production incident):
+  HTTP 429 is `RateLimited` unless the body carries explicit, unambiguous
+  quota evidence (`free_quota_exhausted`, quota+exhausted/exceeded,
+  `insufficient quota`, or explicit Chinese combinations such as
+  额度已耗尽/积分已耗尽/积分不足/余额不足). Google-style numeric code 8
+  (`RESOURCE_EXHAUSTED`) without such evidence is **rate limiting** — it can
+  describe RPM/TPM/concurrency/capacity exhaustion just as well. Bare
+  `exhausted` / `balance` / `quota` / `配额` never suffice. Classification
+  logs record a machine-readable reason (`http_429`,
+  `resource_exhausted_code`, `explicit_quota_evidence`, ...) plus the bounded
+  `error.type` / `error_key` marker and numeric code, so verdicts are
+  auditable.
+- Authoritative quota querying: **intentionally not implemented.** The
+  logged-in dashboard reads live pool data from control-plane endpoints
+  discovered in the console JavaScript bundle
+  (`/lite/console/v1/tokenplan/pool-usage`, `.../credit-usage-trend` on
+  `platform.sensenova.cn`). Both explicitly reject API-key authentication —
+  an API-key request answers `401` with `error_key: auth_type_disabled`
+  ("Authentication type 'apikey' is not enabled", observed) — and the same
+  paths do not exist on the `token.sensenova.cn` data plane (404, code 5).
+  They require a browser console session, which this proxy will not
+  automate or persist. Dashboard quota data is control-plane only.
 - Error envelope duality (observed): OpenAI-style routes return
   `{"error":{"code":N,"message":…}}`; the Anthropic route returns
   `{"type":"error","error":{"type":…,"message":…}}`.

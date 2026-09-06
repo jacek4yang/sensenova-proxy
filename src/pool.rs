@@ -213,7 +213,7 @@ impl KeyPool {
                     return false;
                 }
                 clear_expired(&mut runtime, now);
-                true
+                runtime.cooling_until.is_none()
             })
             .count()
     }
@@ -347,6 +347,20 @@ mod tests {
         pool.mark_group_cooling("group-1", Duration::from_secs(60));
         let selected = pool.select(&HashSet::new()).unwrap();
         assert_eq!(selected.quota_group.as_ref(), "group-2");
+    }
+
+    #[test]
+    fn cooling_keys_are_not_counted_as_usable() {
+        let pool = pool(2, "a");
+        assert_eq!(pool.usable_count(), 2);
+        pool.mark_key_cooling(0, Duration::from_secs(60));
+        assert_eq!(
+            pool.usable_count(),
+            1,
+            "cooling key must not count as usable"
+        );
+        pool.mark_group_cooling("a", Duration::from_secs(60));
+        assert_eq!(pool.usable_count(), 0);
     }
 
     #[test]
