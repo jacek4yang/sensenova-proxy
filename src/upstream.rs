@@ -457,6 +457,10 @@ impl Core {
                             request_id,
                             credential = %selected.name,
                             attempt,
+                            classification = class.as_str(),
+                            classification_reason = classification.reason.as_str(),
+                            upstream_error_code = classification.numeric_code,
+                            upstream_error_kind = classification.error_kind.as_deref().unwrap_or(""),
                             cooldown_ms = cooldown.as_millis() as u64,
                             hint_source,
                             "rate limited before commit; failing over to the next key"
@@ -481,6 +485,10 @@ impl Core {
                             request_id,
                             credential = %selected.name,
                             attempt,
+                            classification = class.as_str(),
+                            classification_reason = classification.reason.as_str(),
+                            upstream_error_code = classification.numeric_code,
+                            upstream_error_kind = classification.error_kind.as_deref().unwrap_or(""),
                             cooldown_ms = cooldown.as_millis() as u64,
                             hint_source,
                             "short rate limit before commit; waiting out the hint on the same key"
@@ -496,6 +504,10 @@ impl Core {
                         request_id,
                         credential = %selected.name,
                         attempt,
+                        classification = class.as_str(),
+                        classification_reason = classification.reason.as_str(),
+                        upstream_error_code = classification.numeric_code,
+                        upstream_error_kind = classification.error_kind.as_deref().unwrap_or(""),
                         cooldown_ms = cooldown.as_millis() as u64,
                         hint_source,
                         "upstream rate limit; returning 429 to client"
@@ -514,6 +526,9 @@ impl Core {
                     metrics
                         .upstream_429_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics
+                        .quota_exhaustion_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let cooldown = hint
                         .as_ref()
                         .map(|hint| hint.duration)
@@ -525,14 +540,29 @@ impl Core {
                     } else {
                         self.pool.mark_key_cooling(selected.index, cooldown);
                     }
-                    self.circuit.record_quota_exhaustion(cooldown);
+                    // Open the global circuit only when no credential remains
+                    // usable. With another quota group still available, the
+                    // group cooling above already protects the exhausted
+                    // domain; a global circuit would wrongly block those
+                    // other groups too.
+                    let circuit_opened = if self.pool.usable_count() == 0 {
+                        self.circuit.record_quota_exhaustion(cooldown);
+                        true
+                    } else {
+                        false
+                    };
                     tracing::error!(
                         request_id,
                         credential = %selected.name,
                         quota_group = %selected.quota_group,
                         attempt,
+                        classification = class.as_str(),
+                        classification_reason = classification.reason.as_str(),
+                        upstream_error_code = classification.numeric_code,
+                        upstream_error_kind = classification.error_kind.as_deref().unwrap_or(""),
+                        circuit_opened,
                         cooldown_ms = cooldown.as_millis() as u64,
-                        "quota exhaustion; cooling the failure domain and opening the circuit"
+                        "quota exhaustion; cooling the failure domain"
                     );
                     return Err(GatewayError {
                         status: StatusCode::TOO_MANY_REQUESTS,

@@ -2,12 +2,21 @@
 //!
 //! SenseNova error envelopes observed in the wild:
 //! - OpenAI-style routes: `{"error":{"code":<int>,"message":"..."}}` with
-//!   Google-API-style numeric codes (code 16 = UNAUTHENTICATED was observed).
+//!   Google-API-style numeric codes (code 16 = UNAUTHENTICATED was observed;
+//!   the control plane also answers with `error_key` / gRPC `ErrorInfo`
+//!   details).
 //! - Anthropic route: `{"type":"error","error":{"type":...,"message":...}}`.
+//! - Generic rate limiting (observed in production): HTTP 429 with busy/retry
+//!   wording while the account's Token Plan dashboard still shows substantial
+//!   remaining credits. Official documentation therefore maps HTTP 429 to
+//!   "rate limiting → back off and retry", and explicit markers such as
+//!   `FREE_QUOTA_EXHAUSTED` to plan-quota exhaustion.
 //!
-//! Quota-exhaustion detection relies on HTTP status plus explicit quota
-//! wording and (inferred, not directly provoked) numeric code 8
-//! (RESOURCE_EXHAUSTED in the same numbering system). Body text containing
+//! Consequence for classification: HTTP 429 is **always** `RateLimited`
+//! unless the body carries explicit, unambiguous quota-exhaustion evidence.
+//! Google-style numeric code 8 (`RESOURCE_EXHAUSTED`) alone describes any
+//! exhausted server-side resource (RPM/TPM/concurrency/capacity) and must
+//! never by itself equate to account credit exhaustion. Body text containing
 //! "429" alone never classifies anything.
 
 use std::time::{Duration, SystemTime};
@@ -86,6 +95,41 @@ impl RetryHintSource {
     }
 }
 
+/// Why the classifier produced its verdict. Observability only — the class
+/// itself is what drives behavior — but logs must be able to answer "why was
+/// this classified as X?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassificationReason {
+    /// Plain HTTP 429 with no explicit quota evidence.
+    Http429RateLimit,
+    /// Rate-limited verdict where Google-style code 8 (RESOURCE_EXHAUSTED)
+    /// was present but no explicit quota evidence: per official semantics
+    /// code 8 covers any exhausted server-side resource (RPM, TPM,
+    /// concurrency, capacity), not just account credits.
+    ResourceExhaustedCode,
+    /// The body carried explicit, unambiguous quota-exhaustion evidence.
+    ExplicitQuotaEvidence,
+    /// Explicit quota evidence under a non-429 status.
+    ExplicitQuotaEvidenceOffStatus,
+    /// Mapped purely from the HTTP status code (5xx, 401, 404, ...).
+    HttpStatus,
+    /// No specific signal matched.
+    UnknownBody,
+}
+
+impl ClassificationReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http429RateLimit => "http_429",
+            Self::ResourceExhaustedCode => "resource_exhausted_code",
+            Self::ExplicitQuotaEvidence => "explicit_quota_evidence",
+            Self::ExplicitQuotaEvidenceOffStatus => "explicit_quota_evidence_off_429",
+            Self::HttpStatus => "http_status",
+            Self::UnknownBody => "unknown_body",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RetryHint {
     pub duration: Duration,
@@ -99,6 +143,12 @@ pub struct ClassifiedUpstreamError {
     /// True when the failure looks account-level (shared quota group), as
     /// opposed to a per-key transient rate limit.
     pub quota_group_exhausted: bool,
+    pub reason: ClassificationReason,
+    /// Google-style numeric error code from the body, if any (observability).
+    pub numeric_code: Option<i64>,
+    /// Bounded, credential-free error kind marker for logs: the Anthropic
+    /// `error.type`, or the control-plane `error_key`, if present.
+    pub error_kind: Option<String>,
 }
 
 pub fn classify_upstream_error(
@@ -117,32 +167,81 @@ pub fn classify_upstream_error(
         })
         .unwrap_or_default();
     let numeric_code = value.as_ref().and_then(numeric_error_code);
+    let error_kind = value
+        .as_ref()
+        .and_then(error_kind_marker)
+        .map(str::to_owned);
+    let explicit_quota = is_explicit_quota_exhaustion(&message);
 
-    let (class, quota_group_exhausted) = match status.as_u16() {
+    let (class, quota_group_exhausted, reason) = match status.as_u16() {
         429 => {
-            let quota = is_quota_exhausted(&message, numeric_code);
-            (
-                if quota {
-                    UpstreamErrorClass::QuotaExhausted
-                } else {
-                    UpstreamErrorClass::RateLimited
-                },
-                quota,
-            )
+            if explicit_quota {
+                (
+                    UpstreamErrorClass::QuotaExhausted,
+                    true,
+                    ClassificationReason::ExplicitQuotaEvidence,
+                )
+            } else if numeric_code == Some(8) {
+                // RESOURCE_EXHAUSTED without quota evidence: any exhausted
+                // server-side resource. Rate limiting, not account exhaustion.
+                (
+                    UpstreamErrorClass::RateLimited,
+                    false,
+                    ClassificationReason::ResourceExhaustedCode,
+                )
+            } else {
+                (
+                    UpstreamErrorClass::RateLimited,
+                    false,
+                    ClassificationReason::Http429RateLimit,
+                )
+            }
         }
-        401 => (UpstreamErrorClass::Authentication, false),
-        403 => (UpstreamErrorClass::Permission, false),
-        400 | 405 | 413 | 422 => (UpstreamErrorClass::InvalidRequest, false),
-        404 => (UpstreamErrorClass::NotFound, false),
-        408 => (UpstreamErrorClass::QueueTimeout, false),
-        500 | 502 | 503 | 504 => (UpstreamErrorClass::ServerTransient, false),
+        401 => (
+            UpstreamErrorClass::Authentication,
+            false,
+            ClassificationReason::HttpStatus,
+        ),
+        403 => (
+            UpstreamErrorClass::Permission,
+            false,
+            ClassificationReason::HttpStatus,
+        ),
+        400 | 405 | 413 | 422 => (
+            UpstreamErrorClass::InvalidRequest,
+            false,
+            ClassificationReason::HttpStatus,
+        ),
+        404 => (
+            UpstreamErrorClass::NotFound,
+            false,
+            ClassificationReason::HttpStatus,
+        ),
+        408 => (
+            UpstreamErrorClass::QueueTimeout,
+            false,
+            ClassificationReason::HttpStatus,
+        ),
+        500 | 502 | 503 | 504 => (
+            UpstreamErrorClass::ServerTransient,
+            false,
+            ClassificationReason::HttpStatus,
+        ),
         _ => {
             // Account-level exhaustion may arrive under unexpected statuses;
             // require explicit quota wording before inferring it.
-            if is_quota_exhausted(&message, numeric_code) {
-                (UpstreamErrorClass::QuotaExhausted, true)
+            if explicit_quota {
+                (
+                    UpstreamErrorClass::QuotaExhausted,
+                    true,
+                    ClassificationReason::ExplicitQuotaEvidenceOffStatus,
+                )
             } else {
-                (UpstreamErrorClass::Unknown, false)
+                (
+                    UpstreamErrorClass::Unknown,
+                    false,
+                    ClassificationReason::UnknownBody,
+                )
             }
         }
     };
@@ -159,6 +258,9 @@ pub fn classify_upstream_error(
         class,
         retry_hint,
         quota_group_exhausted,
+        reason,
+        numeric_code,
+        error_kind,
     }
 }
 
@@ -314,28 +416,51 @@ pub fn parse_retry_duration(input: &str) -> Option<Duration> {
     duration_with_cap(Duration::from_millis(total_ms))
 }
 
-fn is_quota_exhausted(message: &str, numeric_code: Option<i64>) -> bool {
-    // Numeric code 8 = RESOURCE_EXHAUSTED in the Google-style code numbering
-    // SenseNova uses (code 16 = UNAUTHENTICATED was observed). Inferred, not
-    // directly provoked during the compatibility investigation.
-    if numeric_code == Some(8) {
-        return true;
-    }
+/// Strong, unambiguous quota-exhaustion evidence in an upstream error body.
+///
+/// Deliberately conservative: a false positive cools an entire quota group
+/// and opens the circuit, while a false negative merely costs one extra
+/// attempt on another credential. Only quota-scoped combinations qualify —
+/// never a bare "exhausted", "balance", "quota", "配额", or Google-style
+/// code 8 (`RESOURCE_EXHAUSTED`), all of which describe ordinary rate
+/// limiting or any exhausted server-side resource just as often as billing
+/// exhaustion. Chinese markers are accepted only as full explicit
+/// combinations (额度/积分/余额 + 不足/耗尽), never bare nouns.
+fn is_explicit_quota_exhaustion(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
+        // The documented Token Plan marker (official FAQ distinguishes this
+        // from ordinary 429 rate limiting).
+        "free_quota_exhausted",
+        "free quota exhausted",
+        // Quota + exhausted/exceeded combinations.
         "quota exhausted",
         "quota_exhausted",
-        "free_quota_exhausted",
-        "quota exhausted",
-        "exhausted",
+        "quota has been exhausted",
         "quota exceeded",
         "insufficient quota",
-        "balance",
+        // Explicit Chinese combinations (not bare 配额/余额).
+        "额度已耗尽",
+        "积分已耗尽",
+        "积分不足",
         "余额不足",
-        "配额",
     ]
     .iter()
     .any(|phrase| lower.contains(phrase))
+}
+
+/// Bounded, credential-free error-kind marker for logs: the Anthropic-style
+/// `error.type`, or the control-plane `error_key`, if present.
+fn error_kind_marker(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    if let Some(kind) = object
+        .get("error")
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+    {
+        return Some(kind);
+    }
+    object.get("error_key").and_then(Value::as_str)
 }
 
 fn numeric_error_code(value: &Value) -> Option<i64> {
@@ -437,13 +562,10 @@ mod tests {
         );
         assert_eq!(classified.class, UpstreamErrorClass::QuotaExhausted);
         assert!(classified.quota_group_exhausted);
-    }
-
-    #[test]
-    fn numeric_code_8_is_treated_as_quota_exhausted() {
-        let classified = classify_status(429, br#"{"error":{"code":8,"message":"limited"}}"#);
-        assert_eq!(classified.class, UpstreamErrorClass::QuotaExhausted);
-        assert!(classified.quota_group_exhausted);
+        assert_eq!(
+            classified.reason,
+            ClassificationReason::ExplicitQuotaEvidence
+        );
     }
 
     #[test]
@@ -451,6 +573,148 @@ mod tests {
         let classified = classify_status(429, br#"{"error":{"message":"slow down"}}"#);
         assert_eq!(classified.class, UpstreamErrorClass::RateLimited);
         assert!(!classified.quota_group_exhausted);
+    }
+
+    /// §31 matrix: generic 429s — including Google-style code 8
+    /// (RESOURCE_EXHAUSTED) without quota wording — must classify as
+    /// RateLimited, never QuotaExhausted.
+    #[test]
+    fn generic_429s_are_rate_limited_not_quota() {
+        for (label, body) in [
+            ("empty body", ""),
+            (
+                "code 8 RESOURCE_EXHAUSTED",
+                r#"{"error":{"code":8,"message":"RESOURCE_EXHAUSTED"}}"#,
+            ),
+            (
+                "code 8 busy",
+                r#"{"error":{"code":8,"message":"Server is busy"}}"#,
+            ),
+            ("too many requests", "Too many requests"),
+            ("rate limit exceeded", "rate limit exceeded"),
+            ("server resources exhausted", "server resources exhausted"),
+            ("bare RESOURCE_EXHAUSTED", "RESOURCE_EXHAUSTED"),
+            (
+                "quota limit temporarily reached",
+                "quota limit temporarily reached",
+            ),
+            (
+                "body merely contains 429",
+                r#"{"error":{"message":"request 429123 failed on worker 429"}}"#,
+            ),
+        ] {
+            let classified = classify_status(429, body.as_bytes());
+            assert_eq!(classified.class, UpstreamErrorClass::RateLimited, "{label}");
+            assert!(!classified.quota_group_exhausted, "{label}");
+            assert!(
+                !matches!(
+                    classified.reason,
+                    ClassificationReason::ExplicitQuotaEvidence
+                ),
+                "{label}"
+            );
+        }
+        // A bare RESOURCE_EXHAUSTED / code 8 gets the dedicated reason so
+        // logs can explain why it stayed a rate limit.
+        let code8 = classify_status(
+            429,
+            br#"{"error":{"code":8,"message":"RESOURCE_EXHAUSTED"}}"#,
+        );
+        assert_eq!(code8.reason, ClassificationReason::ResourceExhaustedCode);
+        assert_eq!(code8.numeric_code, Some(8));
+        let plain = classify_status(429, b"slow down");
+        assert_eq!(plain.reason, ClassificationReason::Http429RateLimit);
+    }
+
+    /// §31 matrix: explicit quota-exhaustion evidence — and only such
+    /// evidence — promotes a 429 to QuotaExhausted.
+    #[test]
+    fn explicit_quota_evidence_promotes_to_quota_exhausted() {
+        for (label, body) in [
+            (
+                "FREE_QUOTA_EXHAUSTED",
+                r#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#,
+            ),
+            (
+                "free_quota_exhausted",
+                r#"{"error":{"message":"free_quota_exhausted"}}"#,
+            ),
+            (
+                "quota exhausted",
+                r#"{"error":{"message":"your quota has been exhausted"}}"#,
+            ),
+            (
+                "quota exceeded",
+                r#"{"error":{"message":"quota exceeded for this plan"}}"#,
+            ),
+            (
+                "code 8 + FREE_QUOTA_EXHAUSTED",
+                r#"{"error":{"code":8,"message":"FREE_QUOTA_EXHAUSTED"}}"#,
+            ),
+            (
+                "insufficient quota",
+                r#"{"error":{"message":"insufficient quota remaining"}}"#,
+            ),
+            ("中文 额度已耗尽", r#"{"error":{"message":"额度已耗尽"}}"#),
+            ("中文 积分不足", r#"{"error":{"message":"积分不足"}}"#),
+            ("中文 余额不足", r#"{"error":{"message":"余额不足"}}"#),
+        ] {
+            let classified = classify_status(429, body.as_bytes());
+            assert_eq!(
+                classified.class,
+                UpstreamErrorClass::QuotaExhausted,
+                "{label}"
+            );
+            assert!(classified.quota_group_exhausted, "{label}");
+            assert_eq!(
+                classified.reason,
+                ClassificationReason::ExplicitQuotaEvidence,
+                "{label}"
+            );
+        }
+    }
+
+    /// Bare nouns and ordinary rate-limit wording must never suffice.
+    #[test]
+    fn bare_nouns_never_mean_quota_exhaustion() {
+        for body in ["exhausted", "balance", "配额", "余额", "quota"] {
+            let classified = classify_status(429, body.as_bytes());
+            assert_eq!(classified.class, UpstreamErrorClass::RateLimited, "{body}");
+        }
+    }
+
+    /// Explicit quota evidence under an unexpected (non-5xx, non-mapped)
+    /// status still promotes, with its own observability reason. Mapped
+    /// statuses — including all 5xx — keep their status-based class: a
+    /// spurious body on a transient 5xx must never cool an account.
+    #[test]
+    fn quota_evidence_off_429_status_is_recorded() {
+        let classified = classify_status(505, br#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#);
+        assert_eq!(classified.class, UpstreamErrorClass::QuotaExhausted);
+        assert_eq!(
+            classified.reason,
+            ClassificationReason::ExplicitQuotaEvidenceOffStatus
+        );
+        let transient = classify_status(500, br#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#);
+        assert_eq!(transient.class, UpstreamErrorClass::ServerTransient);
+    }
+
+    /// The bounded error-kind marker must be extracted for logs.
+    #[test]
+    fn error_kind_marker_is_extracted() {
+        let anthropic = classify_status(
+            429,
+            br#"{"type":"error","error":{"type":"rate_limit_error","message":"busy"}}"#,
+        );
+        assert_eq!(anthropic.error_kind.as_deref(), Some("rate_limit_error"));
+        let control_plane = classify_status(
+            401,
+            br#"{"code":16,"error_key":"auth_type_disabled","message":"Unauthenticated"}"#,
+        );
+        assert_eq!(
+            control_plane.error_kind.as_deref(),
+            Some("auth_type_disabled")
+        );
     }
 
     #[test]

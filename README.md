@@ -218,8 +218,12 @@ real-world 429 text ("Server is busy, please try again later") is handled.
 - **429 otherwise** → the credential cools down (hint duration, or the
   configured fallback) and the client receives HTTP 429 with a `Retry-After`
   header so Claude Code's own backoff can take over.
-- **Quota exhaustion** (quota wording or numeric code 8) → the entire quota
-  group cools and the circuit opens until the reset hint. No hammering.
+- **Quota exhaustion** → only *explicit* evidence promotes a 429 to quota
+  exhaustion (`FREE_QUOTA_EXHAUSTED` and equivalent quota-scoped wording;
+  never a plain 429 and never Google-style code 8 alone, which usually means
+  rate limiting). The exhausted quota group cools; other quota groups keep
+  serving; the global circuit opens only when no credential remains usable.
+  No hammering.
 - **Sustained 429/5xx/transport failures** → after `overload_threshold`
   failures within `overload_window_secs`, the circuit opens for
   `overload_open_secs` and requests fail fast without dialing SenseNova.
@@ -258,6 +262,21 @@ Body text merely containing "429" never classifies as a rate limit.
   looking like dead connections.
 - Dropping the downstream body promptly cancels the upstream request and
   releases the concurrency permit.
+
+## Quota visibility
+
+sensenova-proxy does **not** claim to know your remaining credits. No stable
+API-key-authenticated quota endpoint was found: the Token Plan dashboard's
+pool data comes from control-plane endpoints that explicitly reject API-key
+authentication (`401 auth_type_disabled`, observed) and require a browser
+console session, which this proxy will not automate or persist. Estimated
+local usage is therefore not exposed as "remaining quota".
+
+What the proxy does guarantee: HTTP 429 is treated as **rate limiting**
+(per-key cooldown, bounded retry, failover) unless the upstream body carries
+explicit quota-exhaustion evidence such as `FREE_QUOTA_EXHAUSTED` — so a
+transient 429 can no longer trip a false account-wide "quota exhausted"
+circuit while your dashboard still shows remaining credits.
 
 ## Known SenseNova quirks (observed 2026-09-06)
 
