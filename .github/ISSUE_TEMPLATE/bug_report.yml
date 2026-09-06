@@ -1,0 +1,63 @@
+name: Bug report
+description: Something does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **DO NOT paste API keys, gateway keys, or Authorization headers.**
+        Sanitize all logs and request bodies before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: sensenova-proxy version or commit
+      placeholder: e.g. 5270e77
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: e.g. Windows 11, Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: cc-version
+    attributes:
+      label: Claude Code version
+      placeholder: e.g. 2.x
+    validations:
+      required: false
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Streaming or non-streaming?
+      options:
+        - streaming
+        - non-streaming
+        - both
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model requested and upstream model
+      placeholder: e.g. claude-sensenova -> sensenova-6.8-flash-lite
+    validations:
+      required: false
+  - type: textarea
+    id: error
+    attributes:
+      label: Sanitized error / relevant log lines
+      description: Remove all credentials. Request IDs from logs are fine.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps, including the relevant config section with secrets removed.
+      render: text
+    validations:
+      required: true

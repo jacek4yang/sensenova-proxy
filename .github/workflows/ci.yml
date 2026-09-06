@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo check
+        run: cargo check --all-targets --all-features --locked
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  tests:
+    name: Tests (${{ matrix.os }})
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - name: cargo test
+        run: cargo test --all-targets --all-features --locked
+
+  required:
+    name: Required
+    needs: [quality, tests]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Verify all mandatory jobs succeeded
+        shell: bash
+        run: |
+          echo "quality: ${{ needs.quality.result }}"
+          echo "tests:   ${{ needs.tests.result }}"
+          if [ "${{ needs.quality.result }}" != "success" ]; then
+            echo "mandatory job 'quality' did not succeed"; exit 1
+          fi
+          if [ "${{ needs.tests.result }}" != "success" ]; then
+            echo "mandatory job 'tests' did not succeed"; exit 1
+          fi
+          echo "all mandatory jobs succeeded"

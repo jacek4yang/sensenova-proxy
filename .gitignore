@@ -2,3 +2,7 @@
 config.json
 *.local.json
 Cargo.lock.bak
+.env
+.env.*
+*.log
+*.tmp

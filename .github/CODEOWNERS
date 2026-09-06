@@ -1,0 +1,4 @@
+# Default review routing. This repository intentionally does not require
+# CODEOWNERS approval on main (single-maintainer project); this file only
+# routes automatic review requests.
+* @jacek4yang
