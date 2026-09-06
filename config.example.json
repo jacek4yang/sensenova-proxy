@@ -1,0 +1,58 @@
+{
+  "server": {
+    "bind": "127.0.0.1:8789",
+    "api_key": "change-me-to-a-long-random-gateway-key"
+  },
+  "upstream": {
+    "base_url": "https://token.sensenova.cn",
+    "messages_path": "/v1/messages",
+    "anthropic_version": "2023-06-01",
+    "timeout_secs": 600,
+    "connect_timeout_secs": 20,
+    "first_byte_timeout_secs": 120
+  },
+  "sensenova_api_keys": [
+    {
+      "name": "primary",
+      "api_key": "YOUR_SENSENOVA_API_KEY",
+      "enabled": true,
+      "quota_group": "account-a"
+    }
+  ],
+  "models": {
+    "default": "sensenova-6.8-flash-lite",
+    "map_unknown_to_default": true,
+    "aliases": {
+      "claude-sensenova": "sensenova-6.8-flash-lite",
+      "claude-sonnet-4-5": "sensenova-6.8-flash-lite",
+      "claude-haiku-4-5": "sensenova-6.8-flash-lite"
+    }
+  },
+  "retry": {
+    "max_attempts": 2,
+    "backoff_initial_ms": 250,
+    "backoff_max_ms": 4000,
+    "retry_429_with_short_retry_after": true,
+    "max_retry_after_secs_for_retry": 10
+  },
+  "concurrency": {
+    "initial": 2,
+    "minimum": 1,
+    "maximum": 8,
+    "queue_capacity": 32,
+    "queue_timeout_secs": 120
+  },
+  "circuit": {
+    "overload_threshold": 5,
+    "overload_window_secs": 60,
+    "overload_open_secs": 30,
+    "max_quota_cooldown_secs": 86400
+  },
+  "runtime": {
+    "max_request_bytes": 33554432,
+    "log_level": "info",
+    "log_format": "pretty",
+    "stream_ping_secs": 15,
+    "shutdown_timeout_secs": 30
+  }
+}
