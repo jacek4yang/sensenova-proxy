@@ -25,7 +25,8 @@
     "aliases": {
       "claude-sensenova": "sensenova-6.8-flash-lite",
       "claude-sonnet-4-5": "sensenova-6.8-flash-lite",
-      "claude-haiku-4-5": "sensenova-6.8-flash-lite"
+      "claude-haiku-4-5": "sensenova-6.8-flash-lite",
+      "claude-deepseek": "deepseek-v4-pro"
     }
   },
   "retry": {

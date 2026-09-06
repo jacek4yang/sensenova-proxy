@@ -106,6 +106,48 @@ fallback is ever added; sensenova-proxy v1 does not use this path).
   `{"error":{"code":N,"message":…}}`; the Anthropic route returns
   `{"type":"error","error":{"type":…,"message":…}}`.
 
+## DeepSeek V4 Pro (`deepseek-v4-pro`)
+
+Probed 2026-09-06 on both endpoints. Evidence level: **observed** except
+where noted. Catalog metadata (`GET /v1/models`): text-only I/O, 1 048 576
+context, 65 536 max output, features `tools`/`json_mode`/`reasoning`
+(**upstream metadata**, not independently load-tested).
+
+### Model identifier resolution (observed)
+
+| Candidate on `/v1/messages` | Result                                                                 |
+| --------------------------- | ---------------------------------------------------------------------- |
+| `deepseek-v4-pro`           | **200 OK** — the correct identifier.                                    |
+| `deepseek/deepseek-v4-pro`  | 404 `not_found_error` "model is not found".                              |
+| `sensenova/deepseek-v4-pro` | 404 `not_found_error` "model is not found".                              |
+
+A previously reported `400 invalid model format. Expected format:
+modelType/model` for the plain ID **did not reproduce**; the endpoint
+currently accepts the plain catalog ID. Upstream resolves the model to a
+dated snapshot: responses report `"model": "deepseek-v4-pro-0813"`.
+
+### Anthropic endpoint capabilities (all observed)
+
+| Capability                        | Result | Notes                                                                        |
+| --------------------------------- | ------ | ---------------------------------------------------------------------------- |
+| plain text (non-stream)           | works  |                                                                              |
+| reasoning                         | works  | **On by default**: a signature-less `thinking` block is emitted even without a `thinking` parameter. |
+| `thinking: {"type":"disabled"}`   | works  | Suppresses reasoning entirely (no thinking block).                            |
+| `thinking: {"type":"enabled","budget_tokens":N}` | works | Accepted; thinking block returned.                    |
+| tools + `tool_use`                | works  | `call_*` IDs, `stop_reason:"tool_use"`.                                      |
+| `tool_result` round-trip          | works  | Including unsigned thinking blocks in assistant history.                     |
+| streaming text                    | works  | Standard Anthropic lifecycle.                                                |
+| streaming tools                   | works  | `input_json_delta` fragmented across many deltas (observed split mid-string). |
+| `system` (array) + `temperature`  | works  |                                                                              |
+| images                            | not tested | Catalog says text-only input.                                            |
+| 1M context                        | not tested | Advertised upstream metadata; no large-context load test performed.      |
+
+### OpenAI endpoint (`/v1/chat/completions`, observed)
+
+Also serves `deepseek-v4-pro` (text with `reasoning_content` field,
+`reasoning_tokens` in usage). Not needed by this proxy: the native Anthropic
+path works, so no OpenAI translation layer exists.
+
 ## Claude Code compatibility assessment
 
 - Claude Code's Anthropic Messages workload (system+tools+tool loop, streaming,
@@ -118,7 +160,9 @@ fallback is ever added; sensenova-proxy v1 does not use this path).
 
 ## Architecture decision
 
-**Strategy A — native Anthropic passthrough** was selected:
+**Strategy A — native Anthropic passthrough** was selected (this also
+covers `deepseek-v4-pro`, which was later confirmed to work natively on
+`/v1/messages` — no model-specific adapter is needed):
 
 1. `/v1/messages` is genuinely compatible with the full Claude Code workload
    (observed), including streaming lifecycle and tool use.
