@@ -1,3 +1,5 @@
+[![CI](https://github.com/jacek4yang/sensenova-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/jacek4yang/sensenova-proxy/actions/workflows/ci.yml)
+
 # sensenova-proxy
 
 `sensenova-proxy` is a small Rust gateway that makes SenseTime **SenseNova
