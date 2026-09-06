@@ -8,6 +8,12 @@ use crate::config::Config;
 use crate::error::ProtocolError;
 
 /// Resolve a client-requested model name to the upstream model.
+///
+/// `map_unknown_to_default` protects against Claude Code's built-in model
+/// names (`claude-*`, e.g. the small fast model) 404-ing upstream. Any other
+/// unknown name — such as an explicit SenseNova catalog ID like
+/// `deepseek-v4-pro` — passes through unchanged so it can be served (or
+/// honestly 404) upstream instead of being silently rewritten to the default.
 pub fn resolve_model(config: &Config, requested: &str) -> String {
     if let Some(target) = config.models.aliases.get(requested) {
         return target.clone();
@@ -15,7 +21,7 @@ pub fn resolve_model(config: &Config, requested: &str) -> String {
     if requested == config.models.default {
         return requested.to_owned();
     }
-    if config.models.map_unknown_to_default {
+    if config.models.map_unknown_to_default && requested.starts_with("claude") {
         config.models.default.clone()
     } else {
         requested.to_owned()
@@ -228,6 +234,32 @@ mod tests {
         let mut config = test_config();
         config.models.map_unknown_to_default = false;
         assert_eq!(resolve_model(&config, "something-else"), "something-else");
+    }
+
+    #[test]
+    fn explicit_sensenova_catalog_ids_pass_through_unchanged() {
+        // A direct request for a non-default SenseNova catalog model must not
+        // be silently rewritten to the default (multi-model support).
+        let config = test_config();
+        assert_eq!(resolve_model(&config, "deepseek-v4-pro"), "deepseek-v4-pro");
+        assert_eq!(resolve_model(&config, "glm-5.2"), "glm-5.2");
+        // Claude-family names are the ones protected by the default mapping.
+        assert_eq!(
+            resolve_model(&config, "claude-sonnet-4-6"),
+            "sensenova-6.8-flash-lite"
+        );
+    }
+
+    #[test]
+    fn deepseek_alias_resolves_to_deepseek_catalog_id() {
+        let mut config = test_config();
+        config
+            .models
+            .aliases
+            .insert("claude-deepseek".into(), "deepseek-v4-pro".into());
+        assert_eq!(resolve_model(&config, "claude-deepseek"), "deepseek-v4-pro");
+        // And the resolved target is itself stable under resolution.
+        assert_eq!(resolve_model(&config, "deepseek-v4-pro"), "deepseek-v4-pro");
     }
 
     #[test]

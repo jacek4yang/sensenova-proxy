@@ -135,7 +135,34 @@ URL credentials, zero timeouts, inconsistent concurrency bounds
 and invalid tracing filters. Validation errors identify keys by index only
 and never print key values.
 
-### Multiple API keys and quota groups
+#### Using DeepSeek V4 Pro (and other catalog models)
+
+SenseNova catalog model IDs (for example `deepseek-v4-pro`, `glm-5.2`) work
+natively on the same Anthropic endpoint and are passed through unchanged —
+they are never rewritten to the default model. Point Claude Code at one via
+an alias:
+
+```json
+"models": {
+  "default": "deepseek-v4-pro",
+  "map_unknown_to_default": true,
+  "aliases": { "claude-deepseek": "deepseek-v4-pro" }
+}
+```
+
+```bash
+export ANTHROPIC_MODEL=claude-deepseek
+```
+
+DeepSeek V4 Pro differences (observed — see
+[`docs/sensenova-compatibility.md`](docs/sensenova-compatibility.md)):
+reasoning is **on by default** (signature-less `thinking` blocks are emitted
+even when Claude Code does not ask for thinking; `thinking:
+{"type":"disabled"}` suppresses them), upstream responses report a dated
+snapshot such as `deepseek-v4-pro-0813`, and its advertised 1M context is
+upstream metadata (not independently verified here).
+
+## Multiple API keys and quota groups
 
 Multiple keys are supported, but keys from one SenseNova account are **not
 assumed to have independent quota**. `quota_group` is the failure domain: an

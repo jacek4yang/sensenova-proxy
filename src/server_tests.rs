@@ -408,6 +408,50 @@ async fn missing_max_tokens_is_defaulted() {
 }
 
 #[tokio::test]
+async fn nondefault_catalog_model_passes_through_with_upstream_snapshot_id() {
+    let (base, mock, task) = start_mock().await;
+    // SenseNova resolves catalog IDs to dated snapshots (observed:
+    // deepseek-v4-pro -> deepseek-v4-pro-0813); the response model field
+    // must pass through verbatim.
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(
+            200,
+            json!({
+                "id": "msg_ds", "type": "message", "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "reason"},
+                            {"type": "text", "text": "OK"}],
+                "model": "deepseek-v4-pro-0813",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 8, "output_tokens": 25}
+            })
+            .to_string(),
+        )],
+    )
+    .await;
+    let body = json!({
+        "model": "deepseek-v4-pro",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "Say OK"}]
+    })
+    .to_string();
+    let response = app_for(test_config(base, 1))
+        .oneshot(gateway_request("/v1/messages", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let seen = mock.seen().await;
+    // The explicit catalog ID must reach the upstream unchanged (it is not
+    // the configured default and must not be rewritten to it).
+    assert_eq!(seen[0].body["model"], "deepseek-v4-pro");
+    let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(value["model"], "deepseek-v4-pro-0813");
+    assert_eq!(value["content"][0]["type"], "thinking");
+    assert_eq!(value["content"][1]["text"], "OK");
+    task.abort();
+}
+
+#[tokio::test]
 async fn stream_passthrough_is_verbatim_and_ordered() {
     let (base, mock, task) = start_mock().await;
     let sse = ok_message_sse();
