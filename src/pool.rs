@@ -34,6 +34,10 @@ struct KeyEntry {
 struct KeyRuntime {
     cooling_until: Option<Instant>,
     unusable: bool,
+    /// Consecutive generic-429 (fallback-cooldown) events without an
+    /// authoritative hint or an intervening success. Drives the progressive
+    /// transient rate-limit backoff (5s → 10s → 20s → ...).
+    rate_limit_streak: u32,
 }
 
 #[derive(Clone)]
@@ -173,6 +177,38 @@ impl KeyPool {
         }
         if active_cooled {
             self.advance_if_active(active_index % self.len().max(1));
+        }
+    }
+
+    /// Record a generic 429 (no authoritative Retry-After) for the
+    /// progressive transient-backoff ladder.
+    pub fn note_rate_limit(&self, index: usize) {
+        if let Some(entry) = self.inner.keys.get(index) {
+            let mut runtime = lock(&entry.runtime);
+            runtime.rate_limit_streak = runtime.rate_limit_streak.saturating_add(1);
+        }
+    }
+
+    /// Current consecutive generic-429 count for one credential.
+    pub fn rate_limit_streak(&self, index: usize) -> u32 {
+        self.inner
+            .keys
+            .get(index)
+            .map(|entry| lock(&entry.runtime).rate_limit_streak)
+            .unwrap_or(0)
+    }
+
+    /// A successful exchange resets the transient rate-limit ladder.
+    pub fn note_credential_success(&self, index: usize) {
+        if let Some(entry) = self.inner.keys.get(index) {
+            lock(&entry.runtime).rate_limit_streak = 0;
+        }
+    }
+
+    /// An authoritative upstream hint supersedes the transient ladder.
+    pub fn reset_rate_limit_streak(&self, index: usize) {
+        if let Some(entry) = self.inner.keys.get(index) {
+            lock(&entry.runtime).rate_limit_streak = 0;
         }
     }
 

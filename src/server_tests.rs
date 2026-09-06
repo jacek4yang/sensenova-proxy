@@ -1187,6 +1187,223 @@ async fn quota_cooldown_is_capped_by_configuration() {
     task.abort();
 }
 
+/// §31 KEY REGRESSION: one logical request must never be replayed against
+/// the same key beyond `max_same_key_retries`. With max_attempts=4 and
+/// max_same_key_retries=1, repeated "200 + EOF before first byte" responses
+/// must stop after TWO upstream attempts (initial + one same-key replay),
+/// not four — replaying a 72 KB prompt four times is exactly the TPM burst
+/// this proxy must not create.
+#[tokio::test]
+async fn single_key_stream_eof_replay_is_capped_by_same_key_budget() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![
+            Spec::json(200, "").content_type_sse(),
+            Spec::json(200, "").content_type_sse(),
+            Spec::sse(ok_message_sse()),
+        ],
+    )
+    .await;
+    let mut config = test_config(base, 1);
+    config.retry.max_attempts = 4;
+    config.retry.max_same_key_retries = 1;
+    config.upstream.first_byte_timeout_secs = 2;
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
+        .await
+        .unwrap();
+    // The third upstream attempt was never made: budget exhausted.
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(mock.seen().await.len(), 2, "same-key replay must be capped");
+    task.abort();
+}
+
+/// §32: with another credential available, a pre-commit transient failure
+/// fails over immediately instead of replaying the same key.
+#[tokio::test]
+async fn stream_eof_fails_over_to_next_key_without_same_key_replay() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(200, "").content_type_sse()],
+    )
+    .await;
+    mock.set("sensenova-key-2", vec![Spec::sse(ok_message_sse())])
+        .await;
+    let mut config = test_config(base, 2);
+    config.retry.max_attempts = 4;
+    config.retry.max_same_key_retries = 1;
+    config.upstream.first_byte_timeout_secs = 2;
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let authorizations: Vec<String> = mock
+        .seen()
+        .await
+        .into_iter()
+        .map(|request| request.authorization)
+        .collect();
+    assert_eq!(
+        authorizations,
+        vec![
+            "Bearer sensenova-key-1".to_string(),
+            "Bearer sensenova-key-2".to_string(),
+        ],
+        "one attempt per credential: failover, not A×4"
+    );
+    task.abort();
+}
+
+/// §33/§35: a generic 429 without Retry-After gets the short progressive
+/// fallback cooldown (~5s band for the first occurrence), not 60s.
+#[tokio::test]
+async fn generic_429_fallback_cooldown_is_short_and_progressive() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![
+            Spec::json(429, r#"{"error":{"message":"Server is busy"}}"#),
+            Spec::json(429, r#"{"error":{"message":"Server is busy"}}"#),
+        ],
+    )
+    .await;
+    let mut config = test_config(base, 1);
+    config.retry.max_attempts = 2;
+    config.retry.max_same_key_retries = 1;
+    config.retry.rate_limit_fallback_initial_secs = 5;
+    config.retry.rate_limit_fallback_max_secs = 60;
+    config.retry.retry_429_with_short_retry_after = false;
+    let state = AppState::new(config).unwrap();
+    let app = router(state.clone());
+
+    let first = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = first.headers()[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (5..=8).contains(&retry_after),
+        "first fallback cooldown must be in the ~5s band (5-7.5s + ceil), got {retry_after}"
+    );
+
+    // Second logical request: the key is still cooling, so the request is
+    // answered locally with the earliest remaining cooldown.
+    let second = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(mock.seen().await.len(), 1, "cooldown must shield upstream");
+    task.abort();
+}
+
+/// §35: consecutive generic 429s escalate the fallback ladder (~1s → ~2s
+/// with a 1s initial for test speed). An authoritative Retry-After always
+/// wins over the ladder.
+#[tokio::test]
+async fn repeated_generic_429s_escalate_fallback_ladder() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![
+            Spec::json(429, r#"{"error":{"message":"Server is busy"}}"#),
+            Spec::json(429, r#"{"error":{"message":"Server is busy"}}"#),
+        ],
+    )
+    .await;
+    let mut config = test_config(base, 1);
+    config.retry.max_attempts = 1;
+    config.retry.rate_limit_fallback_initial_secs = 1;
+    config.retry.rate_limit_fallback_max_secs = 60;
+    let state = AppState::new(config).unwrap();
+    let app = router(state.clone());
+
+    let first = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+    let first_retry_after: u64 = first.headers()[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (1..=2).contains(&first_retry_after),
+        "first fallback cooldown must be in the ~1s band, got {first_retry_after}"
+    );
+
+    // Wait out the first short cooldown, then trigger the second one.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    let second = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let second_retry_after: u64 = second.headers()[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (2..=3).contains(&second_retry_after),
+        "second consecutive generic 429 must escalate to the ~2s band, got {second_retry_after}"
+    );
+    assert_eq!(mock.seen().await.len(), 2);
+    task.abort();
+}
+
+/// §38: repeated generic 429s on one credential must never open the global
+/// circuit — a healthy credential in another quota group keeps serving.
+#[tokio::test]
+async fn repeated_generic_429s_do_not_global_block_other_groups() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        (0..5)
+            .map(|_| Spec::json(429, r#"{"error":{"message":"inference tpm exhausted"}}"#))
+            .collect(),
+    )
+    .await;
+    mock.set(
+        "sensenova-key-2",
+        (0..5).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    let mut config = test_config(base, 2);
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    config.retry.retry_429_with_short_retry_after = false;
+    let state = AppState::new(config).unwrap();
+    let app = router(state.clone());
+    for _ in 0..5 {
+        let response = app
+            .clone()
+            .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "group B keeps serving");
+    }
+    assert_eq!(
+        state.core.circuit.state(),
+        crate::circuit::CircuitState::Closed,
+        "generic 429s must not drive the global circuit"
+    );
+    task.abort();
+}
+
 // ---------------------------------------------------------------------------
 // Tests: request validation, local endpoints, auth
 // ---------------------------------------------------------------------------

@@ -30,11 +30,14 @@
     }
   },
   "retry": {
-    "max_attempts": 2,
-    "backoff_initial_ms": 250,
-    "backoff_max_ms": 4000,
+    "max_attempts": 4,
+    "max_same_key_retries": 1,
+    "backoff_initial_ms": 1000,
+    "backoff_max_ms": 5000,
     "retry_429_with_short_retry_after": true,
-    "max_retry_after_secs_for_retry": 10
+    "max_retry_after_secs_for_retry": 10,
+    "rate_limit_fallback_initial_secs": 5,
+    "rate_limit_fallback_max_secs": 60
   },
   "concurrency": {
     "initial": 2,

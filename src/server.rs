@@ -263,6 +263,10 @@ async fn anthropic_messages(
         }
     };
     let session_tag = session_tag(&headers);
+    // Serving-pressure observability only (never used to reject): large
+    // input plus a large output budget is what trips upstream TPM limits.
+    let approx_input_tokens = models::approximate_input_tokens(&upstream_body).unwrap_or(0);
+    let requested_max_tokens = value.get("max_tokens").and_then(Value::as_u64);
 
     // Bounded local admission: no unbounded queue exists.
     let queue_timeout = Duration::from_secs(state.config.concurrency.queue_timeout_secs);
@@ -318,6 +322,8 @@ async fn anthropic_messages(
         session_tag,
         stream,
         request_bytes = upstream_body.len(),
+        approx_input_tokens,
+        requested_max_tokens,
         queue_wait_ms = permit.queue_wait.as_millis() as u64,
         "client request accepted"
     );
