@@ -165,11 +165,33 @@ upstream metadata (not independently verified here).
 ## Multiple API keys and quota groups
 
 Multiple keys are supported, but keys from one SenseNova account are **not
-assumed to have independent quota**. `quota_group` is the failure domain: an
-account-level exhaustion signal cools the whole group, while a per-key rate
-limit cools only that key. A 401 permanently disables only the rejected
-credential. If a single key serves you well, use one key — the pool adds no
-value unless the keys genuinely fail independently.
+assumed to have independent quota**. `quota_group` is the failure domain, and
+failover within one logical request is quota-group-aware:
+
+```json
+"sensenova_api_keys": [
+  { "name": "account-a-1", "api_key": "...", "enabled": true, "quota_group": "account-a" },
+  { "name": "account-a-2", "api_key": "...", "enabled": true, "quota_group": "account-a" },
+  { "name": "account-b-1", "api_key": "...", "enabled": true, "quota_group": "account-b" }
+]
+```
+
+- **Explicit quota exhaustion** (`FREE_QUOTA_EXHAUSTED`, observed wording) →
+  the entire `account-a` group cools and the same logical request fails over
+  to another group (`account-b`) — the client never sees the 429 as long as
+  some group remains within the attempt budget.
+- **Generic 429** (TPM / serving limits) → a credential from a *different*
+  quota group is preferred, since same-group keys likely share the account's
+  serving capacity; same-group siblings are the fallback when no other group
+  exists.
+- **401/403** → credential-specific: a sibling key in the same group remains
+  fully usable (a bad key does not condemn the account).
+
+Failover is always bounded by `retry.max_attempts`, and one credential is
+replayed at most `1 + retry.max_same_key_retries` times per logical request.
+A 401 permanently disables only the rejected credential. If a single key
+serves you well, use one key — the pool adds no value unless the keys
+genuinely fail independently.
 
 ### Model aliasing
 

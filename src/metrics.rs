@@ -18,6 +18,7 @@ pub struct Metrics {
     pub stream_interruptions_total: AtomicU64,
     pub stream_protocol_errors_total: AtomicU64,
     pub retries_total: AtomicU64,
+    pub cross_group_failovers_total: AtomicU64,
     pub tool_calls_total: AtomicU64,
     pub queue_rejections_total: AtomicU64,
     pub circuit_state: AtomicI64,
@@ -187,6 +188,12 @@ impl Metrics {
             "sensenova_proxy_retries_total",
             "Upstream retry attempts performed.",
             self.retries_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_cross_group_failovers_total",
+            "Failovers that switched to a different quota group.",
+            self.cross_group_failovers_total.load(Ordering::Relaxed),
             &mut output,
         );
         counter(

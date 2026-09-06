@@ -12,6 +12,21 @@ use std::time::{Duration, Instant};
 
 use crate::config::SensenovaKeyConfig;
 
+/// How the retry planner wants the next credential chosen after a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailoverMode {
+    /// Credential-specific failures (401/403): any usable credential,
+    /// including the same quota group.
+    Any,
+    /// Serving-level failures (generic 429, stream EOF, transport, 5xx):
+    /// prefer a different quota group (likely a different TPM/serving
+    /// domain); same-group candidates are a fallback.
+    PreferOtherGroup,
+    /// Explicit quota exhaustion: the failed group has been cooled; only a
+    /// different quota group qualifies.
+    RequireOtherGroup,
+}
+
 #[derive(Clone)]
 pub struct KeyPool {
     inner: Arc<Inner>,
@@ -105,18 +120,44 @@ impl KeyPool {
     /// Select the sticky active credential, or the next usable credential in
     /// configured order. `attempted` bounds the per-request failover walk.
     pub fn select(&self, attempted: &HashSet<usize>) -> Option<SelectedKey> {
+        self.select_for_failover(attempted, None, FailoverMode::Any)
+    }
+
+    /// Failover selection with quota-group awareness.
+    ///
+    /// Scan order starts at the sticky active index and walks configured
+    /// order, skipping attempted / unusable / cooling credentials (expired
+    /// cooldowns clear lazily), exactly like [`Self::select`]. When
+    /// `failed_group` is set and `prefer_other_group` is true, the first
+    /// usable credential from a *different* quota group wins; same-group
+    /// candidates are remembered only as a fallback for when no other group
+    /// is usable. With `require_other_group` the same-group fallback is
+    /// disabled entirely — used for explicit quota exhaustion, where the
+    /// whole failed group has just been cooled and must not be retried even
+    /// if some cooldown state looks stale.
+    ///
+    /// Single O(n) scan, no allocation; the sticky active pointer advances
+    /// to the returned credential.
+    pub fn select_for_failover(
+        &self,
+        attempted: &HashSet<usize>,
+        failed_group: Option<&str>,
+        mode: FailoverMode,
+    ) -> Option<SelectedKey> {
         let count = self.len();
         if count == 0 {
             return None;
         }
         let active = self.inner.active.load(Ordering::Acquire) % count;
         let now = Instant::now();
+        let mut same_group_fallback: Option<usize> = None;
         for offset in 0..count {
             let index = (active + offset) % count;
             if attempted.contains(&index) {
                 continue;
             }
-            let entry = self.inner.keys.get(index)?;
+            let entry = &self.inner.keys[index];
+            let same_group = failed_group.is_some_and(|group| entry.quota_group.as_ref() == group);
             let usable = {
                 let mut runtime = lock(&entry.runtime);
                 if runtime.unusable {
@@ -126,25 +167,41 @@ impl KeyPool {
                     runtime.cooling_until.is_none()
                 }
             };
-            if usable {
-                if index != active {
-                    let _ = self.inner.active.compare_exchange(
-                        active,
-                        index,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
-                }
-                return Some(SelectedKey {
-                    index,
-                    configured_index: entry.configured_index,
-                    name: entry.name.clone(),
-                    quota_group: entry.quota_group.clone(),
-                    api_key: entry.api_key.clone(),
-                });
+            if !usable {
+                continue;
+            }
+            let matches = match mode {
+                FailoverMode::Any => true,
+                FailoverMode::PreferOtherGroup => !same_group,
+                FailoverMode::RequireOtherGroup => !same_group,
+            };
+            if matches {
+                return Some(self.take(index, active));
+            }
+            if same_group_fallback.is_none() && mode == FailoverMode::PreferOtherGroup {
+                same_group_fallback = Some(index);
             }
         }
-        None
+        same_group_fallback.map(|index| self.take(index, active))
+    }
+
+    fn take(&self, index: usize, active: usize) -> SelectedKey {
+        if index != active {
+            let _ = self.inner.active.compare_exchange(
+                active,
+                index,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        let entry = &self.inner.keys[index];
+        SelectedKey {
+            index,
+            configured_index: entry.configured_index,
+            name: entry.name.clone(),
+            quota_group: entry.quota_group.clone(),
+            api_key: entry.api_key.clone(),
+        }
     }
 
     /// Mark one key cooling after a per-key rate limit. No other call site may
@@ -383,6 +440,63 @@ mod tests {
         pool.mark_group_cooling("group-1", Duration::from_secs(60));
         let selected = pool.select(&HashSet::new()).unwrap();
         assert_eq!(selected.quota_group.as_ref(), "group-2");
+    }
+
+    #[test]
+    fn failover_modes_prefer_other_group() {
+        // key-0 (group A) is cooling; key-1 (group A) and key-2 (group B)
+        // are usable.
+        let configured = vec![
+            SensenovaKeyConfig {
+                name: "a1".into(),
+                api_key: "s-a1".into(),
+                enabled: true,
+                quota_group: "group-a".into(),
+            },
+            SensenovaKeyConfig {
+                name: "a2".into(),
+                api_key: "s-a2".into(),
+                enabled: true,
+                quota_group: "group-a".into(),
+            },
+            SensenovaKeyConfig {
+                name: "b1".into(),
+                api_key: "s-b1".into(),
+                enabled: true,
+                quota_group: "group-b".into(),
+            },
+        ];
+        let pool = KeyPool::new(&configured);
+        pool.mark_key_cooling(0, Duration::from_secs(60));
+        let mut attempted = HashSet::new();
+        attempted.insert(0);
+
+        let preferred = pool
+            .select_for_failover(&attempted, Some("group-a"), FailoverMode::PreferOtherGroup)
+            .unwrap();
+        assert_eq!(preferred.quota_group.as_ref(), "group-b");
+
+        // Without a different group, PreferOtherGroup falls back to the
+        // same-group sibling.
+        let restricted = KeyPool::new(&configured[0..2]);
+        restricted.mark_key_cooling(0, Duration::from_secs(60));
+        let fallback = restricted
+            .select_for_failover(&attempted, Some("group-a"), FailoverMode::PreferOtherGroup)
+            .unwrap();
+        assert_eq!(fallback.quota_group.as_ref(), "group-a");
+
+        // RequireOtherGroup is strict: no different group means None.
+        assert!(
+            restricted
+                .select_for_failover(&attempted, Some("group-a"), FailoverMode::RequireOtherGroup)
+                .is_none()
+        );
+
+        // Any behaves like the plain scan (same-group sibling allowed).
+        let any = restricted
+            .select_for_failover(&attempted, Some("group-a"), FailoverMode::Any)
+            .unwrap();
+        assert_eq!(any.quota_group.as_ref(), "group-a");
     }
 
     #[test]

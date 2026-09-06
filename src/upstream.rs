@@ -21,7 +21,7 @@ use crate::circuit::{Admission, CircuitBreaker, CircuitState};
 use crate::config::{Config, defaults};
 use crate::error::error_type_for_status;
 use crate::metrics::Metrics;
-use crate::pool::{KeyPool, SelectedKey};
+use crate::pool::{FailoverMode, KeyPool, SelectedKey};
 use crate::rate_limit::{
     RetryHintSource, UpstreamErrorClass, classify_upstream_error, fallback_rate_limit_cooldown,
     transport_error_class,
@@ -228,20 +228,30 @@ impl Core {
                     match self.plan_retry(
                         &attempted,
                         &mut same_key_retries,
-                        selected.index,
+                        &selected,
                         attempt,
+                        FailoverMode::PreferOtherGroup,
                     ) {
                         RetryPlan::Failover(next) => {
                             metrics
                                 .retries_total
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let cross_group = next.quota_group != selected.quota_group;
+                            if cross_group {
+                                metrics
+                                    .cross_group_failovers_total
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             tracing::warn!(
                                 request_id,
                                 credential = %selected.name,
+                                quota_group = %selected.quota_group,
                                 attempt,
                                 retry_reason = "transport_error",
                                 same_key_retry = false,
                                 next_credential = %next.name,
+                                next_quota_group = %next.quota_group,
+                                cross_group_failover = cross_group,
                                 error_class = transport_error_class(&error),
                                 "upstream transport failure before commit; failing over"
                             );
@@ -356,20 +366,30 @@ impl Core {
                             match self.plan_retry(
                                 &attempted,
                                 &mut same_key_retries,
-                                selected.index,
+                                &selected,
                                 attempt,
+                                FailoverMode::PreferOtherGroup,
                             ) {
                                 RetryPlan::Failover(next) => {
                                     metrics
                                         .retries_total
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let cross_group = next.quota_group != selected.quota_group;
+                                    if cross_group {
+                                        metrics
+                                            .cross_group_failovers_total
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                     tracing::warn!(
                                         request_id,
                                         credential = %selected.name,
+                                        quota_group = %selected.quota_group,
                                         attempt,
                                         retry_reason = "stream_eof_before_first_byte",
                                         same_key_retry = false,
                                         next_credential = %next.name,
+                                        next_quota_group = %next.quota_group,
+                                        cross_group_failover = cross_group,
                                         first_byte_failure,
                                         "stream failed before first byte; failing over"
                                     );
@@ -411,20 +431,30 @@ impl Core {
                             match self.plan_retry(
                                 &attempted,
                                 &mut same_key_retries,
-                                selected.index,
+                                &selected,
                                 attempt,
+                                FailoverMode::PreferOtherGroup,
                             ) {
                                 RetryPlan::Failover(next) => {
                                     metrics
                                         .retries_total
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let cross_group = next.quota_group != selected.quota_group;
+                                    if cross_group {
+                                        metrics
+                                            .cross_group_failovers_total
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                     tracing::warn!(
                                         request_id,
                                         credential = %selected.name,
+                                        quota_group = %selected.quota_group,
                                         attempt,
                                         retry_reason = "first_byte_timeout",
                                         same_key_retry = false,
                                         next_credential = %next.name,
+                                        next_quota_group = %next.quota_group,
+                                        cross_group_failover = cross_group,
                                         first_byte_failure = "timeout",
                                         "no first byte before the deadline; failing over"
                                     );
@@ -488,18 +518,33 @@ impl Core {
                 }
                 self.circuit.record_overload();
                 let class = UpstreamErrorClass::ServerTransient;
-                match self.plan_retry(&attempted, &mut same_key_retries, selected.index, attempt) {
+                match self.plan_retry(
+                    &attempted,
+                    &mut same_key_retries,
+                    &selected,
+                    attempt,
+                    FailoverMode::PreferOtherGroup,
+                ) {
                     RetryPlan::Failover(next) => {
                         metrics
                             .retries_total
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let cross_group = next.quota_group != selected.quota_group;
+                        if cross_group {
+                            metrics
+                                .cross_group_failovers_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         tracing::warn!(
                             request_id,
                             credential = %selected.name,
+                            quota_group = %selected.quota_group,
                             attempt,
                             retry_reason = "malformed_upstream_json",
                             same_key_retry = false,
                             next_credential = %next.name,
+                            next_quota_group = %next.quota_group,
+                            cross_group_failover = cross_group,
                             "upstream returned malformed JSON before commit; failing over"
                         );
                         current = Some(next);
@@ -595,9 +640,15 @@ impl Core {
                     let classification_reason = classification.reason.as_str();
                     let upstream_error_code = classification.numeric_code;
                     let upstream_error_kind = classification.error_kind.as_deref().unwrap_or("");
-                    // Prefer immediate failover to another credential.
+                    // Prefer immediate failover to another credential —
+                    // a different quota group first (the 429 is likely an
+                    // account-level serving limit shared by same-group keys).
                     if attempt < self.retry.max_attempts {
-                        if let Some(next) = self.pool.select(&attempted) {
+                        if let Some(next) = self.pool.select_for_failover(
+                            &attempted,
+                            Some(&selected.quota_group),
+                            FailoverMode::PreferOtherGroup,
+                        ) {
                             metrics
                                 .retries_total
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -718,6 +769,36 @@ impl Core {
                         cooldown_ms = cooldown.as_millis() as u64,
                         "quota exhaustion; cooling the failure domain"
                     );
+                    // Same-request cross-group failover: the exhausted group
+                    // is already cooling, so only a *different* quota group
+                    // can be selected. Never a same-key replay for quota
+                    // exhaustion — the whole failure domain is gone.
+                    if attempt < self.retry.max_attempts
+                        && let Some(next) = self.pool.select_for_failover(
+                            &attempted,
+                            Some(&selected.quota_group),
+                            FailoverMode::RequireOtherGroup,
+                        )
+                    {
+                        metrics
+                            .retries_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics
+                            .cross_group_failovers_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            request_id,
+                            credential = %selected.name,
+                            quota_group = %selected.quota_group,
+                            attempt,
+                            same_request_failover = true,
+                            next_credential = %next.name,
+                            next_quota_group = %next.quota_group,
+                            "quota exhaustion; failing over to another quota group"
+                        );
+                        current = Some(next);
+                        continue;
+                    }
                     return Err(GatewayError {
                         status: StatusCode::TOO_MANY_REQUESTS,
                         message,
@@ -767,21 +848,31 @@ impl Core {
                     match self.plan_retry(
                         &attempted,
                         &mut same_key_retries,
-                        selected.index,
+                        &selected,
                         attempt,
+                        FailoverMode::PreferOtherGroup,
                     ) {
                         RetryPlan::Failover(next) => {
                             metrics
                                 .retries_total
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let cross_group = next.quota_group != selected.quota_group;
+                            if cross_group {
+                                metrics
+                                    .cross_group_failovers_total
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             tracing::warn!(
                                 request_id,
                                 credential = %selected.name,
+                                quota_group = %selected.quota_group,
                                 attempt,
                                 upstream_status = status.as_u16(),
                                 retry_reason = "http_5xx",
                                 same_key_retry = false,
                                 next_credential = %next.name,
+                                next_quota_group = %next.quota_group,
+                                cross_group_failover = cross_group,
                                 "transient upstream failure before commit; failing over"
                             );
                             current = Some(next);
@@ -838,22 +929,38 @@ impl Core {
     }
 
     /// Decide the next attempt after a pre-commit transient failure:
-    /// failover to another usable credential first; a same-key replay only
+    /// failover first — preferring a *different quota group* when the
+    /// failure looks account/serving-level — and a same-key replay only
     /// when nothing else is available and the per-key budget allows it.
     fn plan_retry(
         &self,
         attempted: &HashSet<usize>,
         same_key_retries: &mut HashMap<usize, usize>,
-        failed_index: usize,
+        failed: &SelectedKey,
         attempt: usize,
+        mode: FailoverMode,
     ) -> RetryPlan {
         if attempt >= self.retry.max_attempts {
             return RetryPlan::Exhausted;
         }
-        if let Some(next) = self.pool.select(attempted) {
+        let (failed_group, pool_mode) = match mode {
+            FailoverMode::Any => (None, FailoverMode::Any),
+            FailoverMode::PreferOtherGroup => (
+                Some(failed.quota_group.as_ref()),
+                FailoverMode::PreferOtherGroup,
+            ),
+            FailoverMode::RequireOtherGroup => (
+                Some(failed.quota_group.as_ref()),
+                FailoverMode::RequireOtherGroup,
+            ),
+        };
+        if let Some(next) = self
+            .pool
+            .select_for_failover(attempted, failed_group, pool_mode)
+        {
             return RetryPlan::Failover(next);
         }
-        let used = same_key_retries.entry(failed_index).or_insert(0);
+        let used = same_key_retries.entry(failed.index).or_insert(0);
         if *used < self.retry.max_same_key_retries {
             *used += 1;
             return RetryPlan::SameKey(backoff_duration(&self.retry, attempt, pseudo_jitter()));

@@ -124,6 +124,13 @@ fallback is ever added; sensenova-proxy v1 does not use this path).
   `resource_exhausted_code`, `explicit_quota_evidence`, ...) plus the bounded
   `error.type` / `error_key` marker and numeric code, so verdicts are
   auditable.
+- Multi-account failover is **quota-group-aware within a single logical
+  request** (mock-verified): explicit quota exhaustion cools the whole failed
+  group and the same request immediately fails over to another group;
+  generic 429 / stream-EOF / 5xx failovers prefer a different group (likely
+  a different serving domain) with same-group siblings as fallback; 401/403
+  stay credential-specific. All failover remains bounded by
+  `retry.max_attempts`.
 - Authoritative quota querying: **intentionally not implemented.** The
   logged-in dashboard reads live pool data from control-plane endpoints
   discovered in the console JavaScript bundle

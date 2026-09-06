@@ -894,14 +894,15 @@ async fn explicit_quota_exhaustion_spares_other_groups() {
     let state = AppState::new(config).unwrap();
     let app = router(state.clone());
 
-    // First request hits key-1 (group A): explicit quota exhaustion cools
-    // group A and returns 429 without cross-group replay.
-    let first = app
+    // Single logical request: key-1 hits explicit quota exhaustion, the
+    // whole account-a group cools, and the SAME request fails over to
+    // group B — the client never sees a 429.
+    let response = app
         .clone()
         .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
         .await
         .unwrap();
-    assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.status(), StatusCode::OK);
 
     let snapshots = state.core.pool.snapshots();
     assert!(snapshots[0].cooling_remaining.is_some(), "key-1 cools");
@@ -911,7 +912,7 @@ async fn explicit_quota_exhaustion_spares_other_groups() {
     );
     assert!(
         snapshots[2].cooling_remaining.is_none(),
-        "key-3 (group B) must remain usable"
+        "key-3 (group B) remains usable"
     );
     assert_eq!(
         state.core.circuit.state(),
@@ -919,20 +920,21 @@ async fn explicit_quota_exhaustion_spares_other_groups() {
         "circuit must stay closed while another quota group is usable"
     );
 
-    // Second request is served by group B.
-    let second = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(second.status(), StatusCode::OK);
-    let last_authorization = mock
+    // Failover skipped the whole account-a group and landed on key-3;
+    // key-2 was never dialed.
+    let authorizations: Vec<String> = mock
         .seen()
         .await
-        .last()
-        .map(|request| request.authorization.clone())
-        .unwrap_or_default();
-    assert_eq!(last_authorization, "Bearer sensenova-key-3");
+        .into_iter()
+        .map(|request| request.authorization)
+        .collect();
+    assert_eq!(
+        authorizations,
+        vec![
+            "Bearer sensenova-key-1".to_string(),
+            "Bearer sensenova-key-3".to_string(),
+        ]
+    );
     task.abort();
 }
 
@@ -1400,6 +1402,246 @@ async fn repeated_generic_429s_do_not_global_block_other_groups() {
         state.core.circuit.state(),
         crate::circuit::CircuitState::Closed,
         "generic 429s must not drive the global circuit"
+    );
+    task.abort();
+}
+
+/// §18 Test 3: when EVERY quota group reports explicit quota exhaustion
+/// within one logical request, the client finally gets 429 and the global
+/// quota circuit opens (no usable credential remains).
+#[tokio::test]
+async fn all_groups_quota_exhausted_returns_429_and_opens_circuit() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(
+            429,
+            r#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#,
+        )],
+    )
+    .await;
+    mock.set(
+        "sensenova-key-2",
+        vec![Spec::json(
+            429,
+            r#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#,
+        )],
+    )
+    .await;
+    let mut config = test_config(base, 2);
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    config.retry.max_attempts = 2;
+    let state = AppState::new(config).unwrap();
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(mock.seen().await.len(), 2, "both groups were tried");
+    let snapshots = state.core.pool.snapshots();
+    assert!(snapshots[0].cooling_remaining.is_some());
+    assert!(snapshots[1].cooling_remaining.is_some());
+    assert_eq!(
+        state.core.circuit.state(),
+        crate::circuit::CircuitState::Open,
+        "no usable credential remains: quota circuit opens"
+    );
+    task.abort();
+}
+
+/// §18 Test 4: a generic 429 (account-level serving limit) prefers a
+/// credential from a DIFFERENT quota group over a same-group sibling.
+#[tokio::test]
+async fn generic_429_prefers_other_quota_group() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(
+            429,
+            r#"{"error":{"message":"inference tpm exhausted"}}"#,
+        )],
+    )
+    .await;
+    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set("sensenova-key-3", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 3);
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-a".into();
+    config.sensenova_api_keys[2].quota_group = "account-b".into();
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let authorizations: Vec<String> = mock
+        .seen()
+        .await
+        .into_iter()
+        .map(|request| request.authorization)
+        .collect();
+    assert_eq!(
+        authorizations,
+        vec![
+            "Bearer sensenova-key-1".to_string(),
+            "Bearer sensenova-key-3".to_string(),
+        ],
+        "group B must be preferred over the same-group sibling"
+    );
+    task.abort();
+}
+
+/// §18 Test 5: with no other quota group, a generic 429 still fails over to
+/// the same-group sibling.
+#[tokio::test]
+async fn generic_429_falls_back_to_same_group_when_no_other() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(429, r#"{"error":{"message":"busy"}}"#)],
+    )
+    .await;
+    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 2);
+    for key in &mut config.sensenova_api_keys {
+        key.quota_group = "account-a".into();
+    }
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let authorizations: Vec<String> = mock
+        .seen()
+        .await
+        .into_iter()
+        .map(|request| request.authorization)
+        .collect();
+    assert_eq!(
+        authorizations,
+        vec![
+            "Bearer sensenova-key-1".to_string(),
+            "Bearer sensenova-key-2".to_string(),
+        ]
+    );
+    task.abort();
+}
+
+/// §18 Test 6: stream EOF before first byte prefers a different quota
+/// group over the same-group sibling.
+#[tokio::test]
+async fn stream_eof_prefers_other_quota_group() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(200, "").content_type_sse()],
+    )
+    .await;
+    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set("sensenova-key-3", vec![Spec::sse(ok_message_sse())])
+        .await;
+    let mut config = test_config(base, 3);
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-a".into();
+    config.sensenova_api_keys[2].quota_group = "account-b".into();
+    config.upstream.first_byte_timeout_secs = 2;
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let authorizations: Vec<String> = mock
+        .seen()
+        .await
+        .into_iter()
+        .map(|request| request.authorization)
+        .collect();
+    assert_eq!(
+        authorizations,
+        vec![
+            "Bearer sensenova-key-1".to_string(),
+            "Bearer sensenova-key-3".to_string(),
+        ],
+        "EOF failover must prefer group B over the same-group sibling"
+    );
+    task.abort();
+}
+
+/// §18 Test 7: a 401 is credential-specific — the sibling key in the same
+/// quota group remains usable and must not be skipped by group logic.
+#[tokio::test]
+async fn auth_failover_may_stay_in_the_same_group() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(401, r#"{"error":{"code":16,"message":"nope"}}"#)],
+    )
+    .await;
+    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set("sensenova-key-3", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 3);
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-a".into();
+    config.sensenova_api_keys[2].quota_group = "account-b".into();
+    config.retry.max_attempts = 2;
+    let state = AppState::new(config).unwrap();
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let snapshots = state.core.pool.snapshots();
+    assert!(snapshots[0].unusable, "rejected key is disabled");
+    assert!(
+        !snapshots[1].unusable && snapshots[1].cooling_remaining.is_none(),
+        "same-group sibling must NOT be punished for a credential-specific 401"
+    );
+    let authorizations: Vec<String> = mock
+        .seen()
+        .await
+        .into_iter()
+        .map(|request| request.authorization)
+        .collect();
+    assert_eq!(authorizations[0], "Bearer sensenova-key-1");
+    task.abort();
+}
+
+/// §18 Test 8: max_attempts remains the hard cap across group-aware
+/// failover — extra credentials beyond the budget are never dialed.
+#[tokio::test]
+async fn max_attempts_caps_group_aware_failover() {
+    let (base, mock, task) = start_mock().await;
+    for index in 1..=4 {
+        mock.set(
+            &format!("sensenova-key-{index}"),
+            vec![Spec::json(500, r#"{"error":{"message":"boom"}}"#)],
+        )
+        .await;
+    }
+    let mut config = test_config(base, 4);
+    for (index, key) in config.sensenova_api_keys.iter_mut().enumerate() {
+        key.quota_group = format!("group-{}", index + 1);
+    }
+    config.retry.max_attempts = 2;
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        mock.seen().await.len(),
+        2,
+        "credentials beyond the attempt budget must never be dialed"
     );
     task.abort();
 }
