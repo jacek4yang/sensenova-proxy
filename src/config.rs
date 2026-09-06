@@ -132,25 +132,41 @@ impl Default for ModelsConfig {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RetryConfig {
-    /// Maximum upstream attempts per logical request. Claude Code already
-    /// retries; keep this small to avoid multiplying its loop.
+    /// Maximum upstream attempts per logical request across all credentials.
+    /// Claude Code already retries; keep this small to avoid multiplying its
+    /// loop. Prefer spending the budget on *different* credentials: one
+    /// credential is attempted at most `1 + max_same_key_retries` times.
     pub max_attempts: usize,
+    /// How often one credential may be replayed within one logical request
+    /// after a pre-commit transient failure. `1` means: initial attempt plus
+    /// at most one same-key replay — never A×4 on a single key.
+    pub max_same_key_retries: usize,
     pub backoff_initial_ms: u64,
     pub backoff_max_ms: u64,
     /// Whether a 429 with a short Retry-After may be retried within the
     /// attempt budget instead of being returned to the client immediately.
     pub retry_429_with_short_retry_after: bool,
     pub max_retry_after_secs_for_retry: u64,
+    /// First fallback cooldown for a generic 429 without any authoritative
+    /// Retry-After. SenseNova TPM/serving-capacity limits are transient:
+    /// ~5 s beats the previous fixed 60 s, which made one 429 look like a
+    /// minute-long outage. Escalates per consecutive generic 429 up to
+    /// `rate_limit_fallback_max_secs` (5s → 10s → 20s → 40s → 60s).
+    pub rate_limit_fallback_initial_secs: u64,
+    pub rate_limit_fallback_max_secs: u64,
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_attempts: 2,
-            backoff_initial_ms: 250,
-            backoff_max_ms: 4_000,
+            max_attempts: 4,
+            max_same_key_retries: 1,
+            backoff_initial_ms: 1_000,
+            backoff_max_ms: 5_000,
             retry_429_with_short_retry_after: true,
             max_retry_after_secs_for_retry: 10,
+            rate_limit_fallback_initial_secs: 5,
+            rate_limit_fallback_max_secs: 60,
         }
     }
 }
@@ -311,6 +327,18 @@ impl Config {
 
         if self.retry.max_attempts == 0 || self.retry.max_attempts > 4 {
             bail!("retry.max_attempts must be between 1 and 4 (Claude Code already retries)");
+        }
+        if self.retry.max_same_key_retries > 3 {
+            bail!(
+                "retry.max_same_key_retries must be between 0 and 3 (protect the upstream from replay bursts)"
+            );
+        }
+        if self.retry.rate_limit_fallback_initial_secs == 0
+            || self.retry.rate_limit_fallback_max_secs == 0
+            || self.retry.rate_limit_fallback_initial_secs > self.retry.rate_limit_fallback_max_secs
+            || self.retry.rate_limit_fallback_max_secs > 3_600
+        {
+            bail!("retry.rate_limit_fallback_* must satisfy 1 <= initial <= max <= 3600 seconds");
         }
         if self.retry.backoff_initial_ms == 0 || self.retry.backoff_max_ms == 0 {
             bail!("retry.backoff values must be greater than zero");

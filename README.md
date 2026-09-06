@@ -210,21 +210,51 @@ Every upstream error is classified (`UpstreamErrorClass`) from the HTTP
 status, `Retry-After`, and the error body — including SenseNova's Google-style
 numeric codes (`{"error":{"code":16,...}}` was observed for 401). Observed
 real-world 429 text ("Server is busy, please try again later") is handled.
+Classification verdicts are logged with a machine-readable reason
+(`http_429`, `resource_exhausted_code`, `explicit_quota_evidence`, ...) so
+every cooldown can be audited after the fact.
+
+**Token Plan credits and serving limits are different things.** A generic 429
+has been observed in production while the dashboard still showed substantial
+remaining credits; it means transient rate limiting (TPM / concurrency /
+capacity), not credit exhaustion, and is handled as such.
+
+### Retry budget (anti-amplification)
+
+At most `retry.max_attempts` upstream attempts per logical request, and any
+single credential is attempted at most `1 + retry.max_same_key_retries`
+times (default 4 total / 1 same-key replay). When another usable credential
+exists, **failover is always preferred over replaying the same request** —
+immediately re-submitting a large prompt against the account that just
+failed only amplifies the burst. "HTTP 200 whose stream ends before the
+first byte" is treated as potentially having consumed upstream scheduler
+work: it gets at most one same-key replay with 1–1.5 s of backoff, then
+failover or a clean error for Claude Code to handle.
+
+### Generic 429 cooldown ladder
+
+A generic 429 with an authoritative `Retry-After` always uses it. Without
+one, the credential cooldown escalates per consecutive generic 429 —
+~5 s → 10 s → 20 s → 40 s → capped at 60 s (`rate_limit_fallback_*_secs`,
+with jitter) — instead of the previous fixed 60 s that made one transient
+limit look like a minute-long outage. A success resets the ladder.
 
 - **429 with another usable key** → immediate failover (bounded by key count).
 - **429 with a short `Retry-After` (≤ 10 s) and no other key** → the proxy
   waits out the hint once within its attempt budget, then retries the same
   key.
-- **429 otherwise** → the credential cools down (hint duration, or the
-  configured fallback) and the client receives HTTP 429 with a `Retry-After`
-  header so Claude Code's own backoff can take over.
+- **429 otherwise** → the credential cools down and the client receives HTTP
+  429 with a `Retry-After` header so Claude Code's own backoff can take over.
+- **Generic 429s never open the global circuit** — one account's TPM limit
+  says nothing about other accounts; per-key cooldown plus failover is the
+  whole response.
 - **Quota exhaustion** → only *explicit* evidence promotes a 429 to quota
   exhaustion (`FREE_QUOTA_EXHAUSTED` and equivalent quota-scoped wording;
   never a plain 429 and never Google-style code 8 alone, which usually means
   rate limiting). The exhausted quota group cools; other quota groups keep
   serving; the global circuit opens only when no credential remains usable.
   No hammering.
-- **Sustained 429/5xx/transport failures** → after `overload_threshold`
+- **Sustained 5xx/transport failures** → after `overload_threshold`
   failures within `overload_window_secs`, the circuit opens for
   `overload_open_secs` and requests fail fast without dialing SenseNova.
 - **401** → that credential is marked unusable (readiness reflects it);

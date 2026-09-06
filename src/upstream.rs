@@ -8,7 +8,7 @@
 //! this function; the caller streams what it receives without any further
 //! replay path.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,7 +22,10 @@ use crate::config::{Config, defaults};
 use crate::error::error_type_for_status;
 use crate::metrics::Metrics;
 use crate::pool::{KeyPool, SelectedKey};
-use crate::rate_limit::{UpstreamErrorClass, classify_upstream_error, transport_error_class};
+use crate::rate_limit::{
+    RetryHintSource, UpstreamErrorClass, classify_upstream_error, fallback_rate_limit_cooldown,
+    transport_error_class,
+};
 
 #[derive(Clone)]
 pub struct Core {
@@ -35,6 +38,18 @@ pub struct Core {
     anthropic_version: HeaderValue,
     first_byte_timeout: Duration,
     max_quota_cooldown: Duration,
+    rate_limit_fallback_initial: Duration,
+    rate_limit_fallback_max: Duration,
+}
+
+/// What to do after a pre-commit transient failure.
+enum RetryPlan {
+    /// Continue with a different credential.
+    Failover(SelectedKey),
+    /// Replay the same credential after backing off.
+    SameKey(Duration),
+    /// Budget exhausted; surface the failure to the client.
+    Exhausted,
 }
 
 #[derive(Debug)]
@@ -102,10 +117,23 @@ impl Core {
             anthropic_version,
             first_byte_timeout: Duration::from_secs(config.upstream.first_byte_timeout_secs),
             max_quota_cooldown: Duration::from_secs(config.circuit.max_quota_cooldown_secs),
+            rate_limit_fallback_initial: Duration::from_secs(
+                config.retry.rate_limit_fallback_initial_secs,
+            ),
+            rate_limit_fallback_max: Duration::from_secs(config.retry.rate_limit_fallback_max_secs),
         })
     }
 
-    /// Send one logical `/v1/messages` request with bounded failover.
+    /// Send one logical `/v1/messages` request with bounded, TPM-aware
+    /// retrying.
+    ///
+    /// Retry budget: at most `retry.max_attempts` upstream attempts per
+    /// logical request, and any single credential is attempted at most
+    /// `1 + retry.max_same_key_retries` times. When another usable
+    /// credential exists, failover is always preferred over replaying the
+    /// same (possibly large) request against a credential that just failed —
+    /// SenseNova serving limits (TPM/concurrency/capacity) are per account,
+    /// so immediate same-key replay only amplifies the burst.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_messages(
         &self,
@@ -118,7 +146,9 @@ impl Core {
         session_tag: &str,
     ) -> std::result::Result<UpstreamOutcome, GatewayError> {
         let mut attempted: HashSet<usize> = HashSet::with_capacity(self.pool.len());
+        let mut same_key_retries: HashMap<usize, usize> = HashMap::new();
         let mut attempt = 0usize;
+        let mut current = self.pool.select(&attempted);
         loop {
             // Circuit check before every attempt.
             match self.circuit.admit() {
@@ -142,7 +172,7 @@ impl Core {
                 Admission::Allowed => {}
             }
 
-            let Some(selected) = self.pool.select(&attempted) else {
+            let Some(selected) = current else {
                 for snapshot in self.pool.snapshots() {
                     tracing::debug!(
                         request_id,
@@ -195,45 +225,64 @@ impl Core {
                         .upstream_transport_errors_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.circuit.record_overload();
-                    if self.may_retry(&class, attempt) {
-                        metrics
-                            .retries_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if self.pool.select(&attempted).is_some() {
+                    match self.plan_retry(
+                        &attempted,
+                        &mut same_key_retries,
+                        selected.index,
+                        attempt,
+                    ) {
+                        RetryPlan::Failover(next) => {
+                            metrics
+                                .retries_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!(
                                 request_id,
                                 credential = %selected.name,
                                 attempt,
+                                retry_reason = "transport_error",
+                                same_key_retry = false,
+                                next_credential = %next.name,
                                 error_class = transport_error_class(&error),
                                 "upstream transport failure before commit; failing over"
                             );
+                            current = Some(next);
                             continue;
                         }
-                        tracing::warn!(
-                            request_id,
-                            credential = %selected.name,
-                            attempt,
-                            error_class = transport_error_class(&error),
-                            "upstream transport failure before commit; retrying the same key"
-                        );
-                        attempted.remove(&selected.index);
-                        sleep_backoff(&self.retry, attempt).await;
-                        continue;
+                        RetryPlan::SameKey(backoff) => {
+                            metrics
+                                .retries_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                request_id,
+                                credential = %selected.name,
+                                attempt,
+                                retry_reason = "transport_error",
+                                same_key_retry = true,
+                                backoff_ms = backoff.as_millis() as u64,
+                                error_class = transport_error_class(&error),
+                                "upstream transport failure before commit; retrying the same key"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            current = Some(selected);
+                            continue;
+                        }
+                        RetryPlan::Exhausted => {
+                            tracing::error!(
+                                request_id,
+                                credential = %selected.name,
+                                attempt,
+                                error_class = transport_error_class(&error),
+                                "upstream transport failure; not retrying"
+                            );
+                            return Err(GatewayError {
+                                status: StatusCode::BAD_GATEWAY,
+                                message: "could not reach the SenseNova upstream".into(),
+                                class,
+                                retry_after: None,
+                                sanitized_body: None,
+                            });
+                        }
                     }
-                    tracing::error!(
-                        request_id,
-                        credential = %selected.name,
-                        attempt,
-                        error_class = transport_error_class(&error),
-                        "upstream transport failure; not retrying"
-                    );
-                    return Err(GatewayError {
-                        status: StatusCode::BAD_GATEWAY,
-                        message: "could not reach the SenseNova upstream".into(),
-                        class,
-                        retry_after: None,
-                        sanitized_body: None,
-                    });
                 }
             };
 
@@ -260,6 +309,7 @@ impl Core {
                     match first {
                         Ok(Ok(chunk)) => {
                             metrics.note_time_to_first_event(started.elapsed());
+                            self.pool.note_credential_success(selected.index);
                             tracing::info!(
                                 request_id,
                                 client_model,
@@ -283,6 +333,13 @@ impl Core {
                                 .upstream_transport_errors_total
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             self.circuit.record_overload();
+                            let first_byte_failure = match &failure {
+                                FirstByteFailure::Eof => "eof",
+                                FirstByteFailure::Transport(error) if error.is_timeout() => {
+                                    "timeout"
+                                }
+                                FirstByteFailure::Transport(_) => "transport",
+                            };
                             let class = match failure {
                                 FirstByteFailure::Eof => UpstreamErrorClass::TransportTransient,
                                 FirstByteFailure::Transport(ref error) if error.is_timeout() => {
@@ -292,70 +349,117 @@ impl Core {
                                     UpstreamErrorClass::TransportTransient
                                 }
                             };
-                            if self.may_retry(&class, attempt) {
-                                metrics
-                                    .retries_total
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if self.pool.select(&attempted).is_some() {
+                            // A 200 whose stream ends before any byte has
+                            // still likely consumed scheduler work; replays
+                            // must be rare, backed off, and prefer a fresh
+                            // credential over the same one.
+                            match self.plan_retry(
+                                &attempted,
+                                &mut same_key_retries,
+                                selected.index,
+                                attempt,
+                            ) {
+                                RetryPlan::Failover(next) => {
+                                    metrics
+                                        .retries_total
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(
                                         request_id,
                                         credential = %selected.name,
                                         attempt,
+                                        retry_reason = "stream_eof_before_first_byte",
+                                        same_key_retry = false,
+                                        next_credential = %next.name,
+                                        first_byte_failure,
                                         "stream failed before first byte; failing over"
                                     );
+                                    current = Some(next);
                                     continue;
                                 }
-                                tracing::warn!(
-                                    request_id,
-                                    credential = %selected.name,
-                                    attempt,
-                                    "stream failed before first byte; retrying the same key"
-                                );
-                                attempted.remove(&selected.index);
-                                sleep_backoff(&self.retry, attempt).await;
-                                continue;
+                                RetryPlan::SameKey(backoff) => {
+                                    metrics
+                                        .retries_total
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(
+                                        request_id,
+                                        credential = %selected.name,
+                                        attempt,
+                                        retry_reason = "stream_eof_before_first_byte",
+                                        same_key_retry = true,
+                                        backoff_ms = backoff.as_millis() as u64,
+                                        first_byte_failure,
+                                        "stream failed before first byte; retrying the same key"
+                                    );
+                                    tokio::time::sleep(backoff).await;
+                                    current = Some(selected);
+                                    continue;
+                                }
+                                RetryPlan::Exhausted => {
+                                    return Err(GatewayError {
+                                        status: StatusCode::BAD_GATEWAY,
+                                        message: "upstream stream ended before any output".into(),
+                                        class,
+                                        retry_after: None,
+                                        sanitized_body: None,
+                                    });
+                                }
                             }
-                            return Err(GatewayError {
-                                status: StatusCode::BAD_GATEWAY,
-                                message: "upstream stream ended before any output".into(),
-                                class,
-                                retry_after: None,
-                                sanitized_body: None,
-                            });
                         }
                         Err(_timeout) => {
                             self.circuit.record_overload();
                             let class = UpstreamErrorClass::QueueTimeout;
-                            if self.may_retry(&class, attempt) {
-                                metrics
-                                    .retries_total
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if self.pool.select(&attempted).is_some() {
+                            match self.plan_retry(
+                                &attempted,
+                                &mut same_key_retries,
+                                selected.index,
+                                attempt,
+                            ) {
+                                RetryPlan::Failover(next) => {
+                                    metrics
+                                        .retries_total
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(
                                         request_id,
                                         credential = %selected.name,
                                         attempt,
+                                        retry_reason = "first_byte_timeout",
+                                        same_key_retry = false,
+                                        next_credential = %next.name,
+                                        first_byte_failure = "timeout",
                                         "no first byte before the deadline; failing over"
                                     );
+                                    current = Some(next);
                                     continue;
                                 }
-                                tracing::warn!(
-                                    request_id,
-                                    credential = %selected.name,
-                                    attempt,
-                                    "no first byte before the deadline; retrying the same key"
-                                );
-                                attempted.remove(&selected.index);
-                                sleep_backoff(&self.retry, attempt).await;
-                                continue;
+                                RetryPlan::SameKey(backoff) => {
+                                    metrics
+                                        .retries_total
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(
+                                        request_id,
+                                        credential = %selected.name,
+                                        attempt,
+                                        retry_reason = "first_byte_timeout",
+                                        same_key_retry = true,
+                                        backoff_ms = backoff.as_millis() as u64,
+                                        first_byte_failure = "timeout",
+                                        "no first byte before the deadline; retrying the same key"
+                                    );
+                                    tokio::time::sleep(backoff).await;
+                                    current = Some(selected);
+                                    continue;
+                                }
+                                RetryPlan::Exhausted => {
+                                    return Err(GatewayError {
+                                        status: StatusCode::GATEWAY_TIMEOUT,
+                                        message: "upstream produced no output before the deadline"
+                                            .into(),
+                                        class,
+                                        retry_after: None,
+                                        sanitized_body: None,
+                                    });
+                                }
                             }
-                            return Err(GatewayError {
-                                status: StatusCode::GATEWAY_TIMEOUT,
-                                message: "upstream produced no output before the deadline".into(),
-                                class,
-                                retry_after: None,
-                                sanitized_body: None,
-                            });
                         }
                     }
                 }
@@ -374,6 +478,7 @@ impl Core {
                         response_bytes = bytes.len(),
                         "SenseNova JSON response buffered"
                     );
+                    self.pool.note_credential_success(selected.index);
                     self.circuit.record_success();
                     return Ok(UpstreamOutcome::Json {
                         body: bytes,
@@ -383,43 +488,61 @@ impl Core {
                 }
                 self.circuit.record_overload();
                 let class = UpstreamErrorClass::ServerTransient;
-                if self.may_retry(&class, attempt) {
-                    metrics
-                        .retries_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if self.pool.select(&attempted).is_some() {
+                match self.plan_retry(&attempted, &mut same_key_retries, selected.index, attempt) {
+                    RetryPlan::Failover(next) => {
+                        metrics
+                            .retries_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(
                             request_id,
                             credential = %selected.name,
                             attempt,
+                            retry_reason = "malformed_upstream_json",
+                            same_key_retry = false,
+                            next_credential = %next.name,
                             "upstream returned malformed JSON before commit; failing over"
                         );
+                        current = Some(next);
                         continue;
                     }
-                    tracing::warn!(
-                        request_id,
-                        credential = %selected.name,
-                        attempt,
-                        "upstream returned malformed JSON before commit; retrying the same key"
-                    );
-                    attempted.remove(&selected.index);
-                    sleep_backoff(&self.retry, attempt).await;
-                    continue;
+                    RetryPlan::SameKey(backoff) => {
+                        metrics
+                            .retries_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            request_id,
+                            credential = %selected.name,
+                            attempt,
+                            retry_reason = "malformed_upstream_json",
+                            same_key_retry = true,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "upstream returned malformed JSON before commit; retrying the same key"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        current = Some(selected);
+                        continue;
+                    }
+                    RetryPlan::Exhausted => {
+                        return Err(GatewayError {
+                            status: StatusCode::BAD_GATEWAY,
+                            message: "upstream returned invalid JSON".into(),
+                            class,
+                            retry_after: None,
+                            sanitized_body: None,
+                        });
+                    }
                 }
-                return Err(GatewayError {
-                    status: StatusCode::BAD_GATEWAY,
-                    message: "upstream returned invalid JSON".into(),
-                    class,
-                    retry_after: None,
-                    sanitized_body: None,
-                });
             }
 
             // Error status: buffer, classify, and decide.
             let headers = response.headers().clone();
             let error_body = read_limited(response, defaults::MAX_ERROR_BODY_BYTES).await;
-            let classification =
-                classify_upstream_error(status, &headers, &error_body, Duration::from_secs(60));
+            let classification = classify_upstream_error(
+                status,
+                &headers,
+                &error_body,
+                self.rate_limit_fallback_initial,
+            );
             let class = classification.class;
             let sanitized = serde_json::from_slice::<Value>(&error_body)
                 .map(|value| {
@@ -441,73 +564,106 @@ impl Core {
                     metrics
                         .upstream_429_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.circuit.record_overload();
-                    let cooldown = hint.as_ref().map(|hint| hint.duration).unwrap_or_default();
+                    // Deliberately NOT record_overload(): a per-credential
+                    // generic 429 (TPM/concurrency/capacity) says nothing
+                    // about other quota groups, and the per-key cooldown plus
+                    // failover already protects the upstream. Five generic
+                    // 429s must never global-block healthy groups.
+                    let fallback_hint = hint
+                        .as_ref()
+                        .is_some_and(|hint| hint.source == RetryHintSource::Fallback);
+                    let cooldown = if fallback_hint {
+                        let streak = self.pool.rate_limit_streak(selected.index);
+                        self.pool.note_rate_limit(selected.index);
+                        fallback_rate_limit_cooldown(
+                            streak,
+                            self.rate_limit_fallback_initial,
+                            self.rate_limit_fallback_max,
+                            pseudo_jitter(),
+                        )
+                    } else {
+                        // Authoritative upstream information supersedes the
+                        // transient ladder.
+                        self.pool.reset_rate_limit_streak(selected.index);
+                        hint.as_ref().map(|hint| hint.duration).unwrap_or_default()
+                    };
                     self.pool.mark_key_cooling(selected.index, cooldown);
                     let hint_source = hint
                         .as_ref()
                         .map(|hint| hint.source.as_str())
-                        .unwrap_or("none");
+                        .unwrap_or("progressive_fallback");
+                    let classification_reason = classification.reason.as_str();
+                    let upstream_error_code = classification.numeric_code;
+                    let upstream_error_kind = classification.error_kind.as_deref().unwrap_or("");
                     // Prefer immediate failover to another credential.
-                    if attempt < self.retry.max_attempts && self.pool.select(&attempted).is_some() {
-                        metrics
-                            .retries_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::warn!(
-                            request_id,
-                            credential = %selected.name,
-                            attempt,
-                            classification = class.as_str(),
-                            classification_reason = classification.reason.as_str(),
-                            upstream_error_code = classification.numeric_code,
-                            upstream_error_kind = classification.error_kind.as_deref().unwrap_or(""),
-                            cooldown_ms = cooldown.as_millis() as u64,
-                            hint_source,
-                            "rate limited before commit; failing over to the next key"
-                        );
-                        continue;
-                    }
-                    // With no alternative key, a short Retry-After may be
-                    // waited out within the attempt budget; the same key is
-                    // retried after its cooldown expires.
-                    let short = hint.as_ref().is_some_and(|hint| {
-                        hint.duration
-                            <= Duration::from_secs(self.retry.max_retry_after_secs_for_retry)
-                    });
-                    if self.retry.retry_429_with_short_retry_after
-                        && short
-                        && attempt < self.retry.max_attempts
-                    {
-                        metrics
-                            .retries_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::warn!(
-                            request_id,
-                            credential = %selected.name,
-                            attempt,
-                            classification = class.as_str(),
-                            classification_reason = classification.reason.as_str(),
-                            upstream_error_code = classification.numeric_code,
-                            upstream_error_kind = classification.error_kind.as_deref().unwrap_or(""),
-                            cooldown_ms = cooldown.as_millis() as u64,
-                            hint_source,
-                            "short rate limit before commit; waiting out the hint on the same key"
-                        );
-                        tokio::time::sleep(
-                            cooldown + backoff_duration(&self.retry, attempt, pseudo_jitter()),
-                        )
-                        .await;
-                        attempted.remove(&selected.index);
-                        continue;
+                    if attempt < self.retry.max_attempts {
+                        if let Some(next) = self.pool.select(&attempted) {
+                            metrics
+                                .retries_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                request_id,
+                                credential = %selected.name,
+                                attempt,
+                                classification = class.as_str(),
+                                classification_reason,
+                                upstream_error_code,
+                                upstream_error_kind,
+                                cooldown_ms = cooldown.as_millis() as u64,
+                                hint_source,
+                                retry_reason = "rate_limited",
+                                same_key_retry = false,
+                                next_credential = %next.name,
+                                "rate limited before commit; failing over to the next key"
+                            );
+                            current = Some(next);
+                            continue;
+                        }
+                        // No alternative credential: a SHORT authoritative
+                        // hint or the short progressive cooldown may be
+                        // waited out once, within the same-key budget.
+                        let short = cooldown
+                            <= Duration::from_secs(self.retry.max_retry_after_secs_for_retry);
+                        let used = same_key_retries.entry(selected.index).or_insert(0);
+                        if self.retry.retry_429_with_short_retry_after
+                            && short
+                            && *used < self.retry.max_same_key_retries
+                        {
+                            *used += 1;
+                            metrics
+                                .retries_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                request_id,
+                                credential = %selected.name,
+                                attempt,
+                                classification = class.as_str(),
+                                classification_reason,
+                                upstream_error_code,
+                                upstream_error_kind,
+                                cooldown_ms = cooldown.as_millis() as u64,
+                                hint_source,
+                                retry_reason = "rate_limited",
+                                same_key_retry = true,
+                                backoff_ms = cooldown.as_millis() as u64,
+                                "short rate limit before commit; waiting out the hint on the same key"
+                            );
+                            tokio::time::sleep(
+                                cooldown + backoff_duration(&self.retry, attempt, pseudo_jitter()),
+                            )
+                            .await;
+                            current = Some(selected);
+                            continue;
+                        }
                     }
                     tracing::warn!(
                         request_id,
                         credential = %selected.name,
                         attempt,
                         classification = class.as_str(),
-                        classification_reason = classification.reason.as_str(),
-                        upstream_error_code = classification.numeric_code,
-                        upstream_error_kind = classification.error_kind.as_deref().unwrap_or(""),
+                        classification_reason,
+                        upstream_error_code,
+                        upstream_error_kind,
                         cooldown_ms = cooldown.as_millis() as u64,
                         hint_source,
                         "upstream rate limit; returning 429 to client"
@@ -516,9 +672,7 @@ impl Core {
                         status: StatusCode::TOO_MANY_REQUESTS,
                         message,
                         class,
-                        retry_after: hint
-                            .map(|hint| hint.duration)
-                            .or_else(|| self.pool.earliest_retry_after()),
+                        retry_after: Some(cooldown),
                         sanitized_body: Some(sanitized),
                     });
                 }
@@ -578,15 +732,21 @@ impl Core {
                         self.pool.mark_unusable(selected.index);
                     }
                     self.circuit.record_neutral_failure();
-                    // Credential problems are per-key: failover is bounded by
-                    // the attempt budget and only when another key exists.
-                    if attempt < self.retry.max_attempts && self.pool.select(&attempted).is_some() {
+                    // Credential problems are per-key: failover only, never a
+                    // same-key replay of a rejected credential.
+                    if attempt < self.retry.max_attempts
+                        && let Some(next) = self.pool.select(&attempted)
+                    {
                         tracing::error!(
                             request_id,
                             credential = %selected.name,
                             attempt,
+                            retry_reason = "credential_rejected",
+                            same_key_retry = false,
+                            next_credential = %next.name,
                             "credential rejected before commit; failing over to the next key"
                         );
+                        current = Some(next);
                         continue;
                     }
                     return Err(GatewayError {
@@ -604,42 +764,61 @@ impl Core {
                         .upstream_5xx_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.circuit.record_overload();
-                    if self.may_retry(&class, attempt) {
-                        metrics
-                            .retries_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if self.pool.select(&attempted).is_some() {
+                    match self.plan_retry(
+                        &attempted,
+                        &mut same_key_retries,
+                        selected.index,
+                        attempt,
+                    ) {
+                        RetryPlan::Failover(next) => {
+                            metrics
+                                .retries_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!(
                                 request_id,
                                 credential = %selected.name,
                                 attempt,
                                 upstream_status = status.as_u16(),
+                                retry_reason = "http_5xx",
+                                same_key_retry = false,
+                                next_credential = %next.name,
                                 "transient upstream failure before commit; failing over"
                             );
+                            current = Some(next);
                             continue;
                         }
-                        tracing::warn!(
-                            request_id,
-                            credential = %selected.name,
-                            attempt,
-                            upstream_status = status.as_u16(),
-                            "transient upstream failure before commit; retrying the same key"
-                        );
-                        attempted.remove(&selected.index);
-                        sleep_backoff(&self.retry, attempt).await;
-                        continue;
+                        RetryPlan::SameKey(backoff) => {
+                            metrics
+                                .retries_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                request_id,
+                                credential = %selected.name,
+                                attempt,
+                                upstream_status = status.as_u16(),
+                                retry_reason = "http_5xx",
+                                same_key_retry = true,
+                                backoff_ms = backoff.as_millis() as u64,
+                                "transient upstream failure before commit; retrying the same key"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            current = Some(selected);
+                            continue;
+                        }
+                        RetryPlan::Exhausted => {
+                            return Err(GatewayError {
+                                status: if status == StatusCode::REQUEST_TIMEOUT {
+                                    StatusCode::GATEWAY_TIMEOUT
+                                } else {
+                                    status
+                                },
+                                message,
+                                class,
+                                retry_after: None,
+                                sanitized_body: Some(sanitized),
+                            });
+                        }
                     }
-                    return Err(GatewayError {
-                        status: if status == StatusCode::REQUEST_TIMEOUT {
-                            StatusCode::GATEWAY_TIMEOUT
-                        } else {
-                            status
-                        },
-                        message,
-                        class,
-                        retry_after: None,
-                        sanitized_body: Some(sanitized),
-                    });
                 }
                 UpstreamErrorClass::InvalidRequest
                 | UpstreamErrorClass::NotFound
@@ -658,8 +837,28 @@ impl Core {
         }
     }
 
-    fn may_retry(&self, class: &UpstreamErrorClass, attempt: usize) -> bool {
-        class.is_retryable_before_commit() && attempt < self.retry.max_attempts
+    /// Decide the next attempt after a pre-commit transient failure:
+    /// failover to another usable credential first; a same-key replay only
+    /// when nothing else is available and the per-key budget allows it.
+    fn plan_retry(
+        &self,
+        attempted: &HashSet<usize>,
+        same_key_retries: &mut HashMap<usize, usize>,
+        failed_index: usize,
+        attempt: usize,
+    ) -> RetryPlan {
+        if attempt >= self.retry.max_attempts {
+            return RetryPlan::Exhausted;
+        }
+        if let Some(next) = self.pool.select(attempted) {
+            return RetryPlan::Failover(next);
+        }
+        let used = same_key_retries.entry(failed_index).or_insert(0);
+        if *used < self.retry.max_same_key_retries {
+            *used += 1;
+            return RetryPlan::SameKey(backoff_duration(&self.retry, attempt, pseudo_jitter()));
+        }
+        RetryPlan::Exhausted
     }
 
     async fn send_once(
@@ -781,11 +980,6 @@ pub fn backoff_duration(
     let jitter = jitter.clamp(0.0, 1.0);
     let value = base as f64 * (1.0 + 0.5 * jitter);
     Duration::from_millis((value as u128).min(max) as u64)
-}
-
-async fn sleep_backoff(retry: &crate::config::RetryConfig, attempt: usize) {
-    let jitter = pseudo_jitter();
-    tokio::time::sleep(backoff_duration(retry, attempt, jitter)).await;
 }
 
 fn pseudo_jitter() -> f64 {

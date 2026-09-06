@@ -102,7 +102,16 @@ fallback is ever added; sensenova-proxy v1 does not use this path).
   body was not retained in the earlier log. Consequence: **generic 429 cannot
   be treated as proof of credit exhaustion.** Official semantics distinguish
   the two: HTTP 429 = rate limiting (back off and retry);
-  `FREE_QUOTA_EXHAUSTED` = explicit plan-quota exhaustion.
+  `FREE_QUOTA_EXHAUSTED` = explicit plan-quota exhaustion. Community reports
+  describe transient limits such as "inference tpm exhausted" — i.e. serving
+  capacity, not credits (no official TPM numbers exist; none are claimed).
+- **HTTP 200 + stream EOF before the first byte observed in production**: a
+  large (72 KB) streaming request returned HTTP 200 and then ended with no
+  SSE bytes at all; replaying it re-submits the full inference, and a client
+  disconnect is typically followed by Claude Code re-sending the request
+  itself (often as non-streaming). The proxy therefore caps same-key replays
+  (`retry.max_same_key_retries`, default 1) and prefers failover — retry
+  amplification is bounded by construction.
 - Quota-exhaustion classification (updated after the production incident):
   HTTP 429 is `RateLimited` unless the body carries explicit, unambiguous
   quota evidence (`free_quota_exhausted`, quota+exhausted/exceeded,

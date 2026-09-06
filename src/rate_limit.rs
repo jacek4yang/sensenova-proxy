@@ -63,17 +63,6 @@ impl UpstreamErrorClass {
             Self::Unknown => "unknown",
         }
     }
-
-    /// Retry only when provably safe and only before any downstream commit.
-    pub fn is_retryable_before_commit(self) -> bool {
-        matches!(
-            self,
-            Self::RateLimited
-                | Self::ServerTransient
-                | Self::TransportTransient
-                | Self::QueueTimeout
-        )
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +331,27 @@ pub fn structured_retry_duration(value: &Value) -> Option<Duration> {
         Value::Array(values) => values.iter().find_map(structured_retry_duration),
         _ => None,
     }
+}
+
+/// Progressive cooldown for a generic 429 that carries no authoritative
+/// `Retry-After`: `initial × 2^streak` with multiplicative jitter in
+/// [1.0, 1.5), capped at `max`. First generic 429 ≈ 5s, then ≈10s, 20s, 40s,
+/// capped at 60s (with the documented defaults) — instead of the previous
+/// fixed 60s that made one transient TPM limit look like a minute-long
+/// outage.
+pub fn fallback_rate_limit_cooldown(
+    streak: u32,
+    initial: Duration,
+    max: Duration,
+    jitter: f64,
+) -> Duration {
+    let step = streak.min(4);
+    let base = initial
+        .as_millis()
+        .saturating_mul(1u128 << step)
+        .min(max.as_millis());
+    let jittered = base as f64 * (1.0 + 0.5 * jitter.clamp(0.0, 1.0));
+    Duration::from_millis((jittered as u64).min(max.as_millis() as u64))
 }
 
 pub fn parse_retry_after_header(input: &str) -> Option<Duration> {
@@ -759,6 +769,48 @@ mod tests {
         assert_eq!(
             classify_status(503, b"overloaded").class,
             UpstreamErrorClass::ServerTransient
+        );
+    }
+
+    #[test]
+    fn progressive_fallback_cooldown_ladder() {
+        let initial = Duration::from_secs(5);
+        let max = Duration::from_secs(60);
+        // Deterministic jitter bounds: streak ladder is 5, 10, 20, 40, then
+        // capped at 60 regardless of further streaks.
+        assert_eq!(
+            fallback_rate_limit_cooldown(0, initial, max, 0.0),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            fallback_rate_limit_cooldown(1, initial, max, 0.0),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            fallback_rate_limit_cooldown(2, initial, max, 0.0),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            fallback_rate_limit_cooldown(3, initial, max, 0.0),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            fallback_rate_limit_cooldown(4, initial, max, 0.0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            fallback_rate_limit_cooldown(9, initial, max, 0.0),
+            Duration::from_secs(60)
+        );
+        // Jitter only ever scales up within [1.0, 1.5) and never past max.
+        let jittered = fallback_rate_limit_cooldown(0, initial, max, 1.0);
+        assert_eq!(jittered, Duration::from_millis(7_500));
+        let capped = fallback_rate_limit_cooldown(4, initial, max, 1.0);
+        assert_eq!(capped, Duration::from_secs(60));
+        assert!(
+            fallback_rate_limit_cooldown(0, initial, max, 0.4) >= Duration::from_secs(5)
+                && fallback_rate_limit_cooldown(0, initial, max, 0.4) <= Duration::from_secs(8),
+            "first fallback cooldown must stay in the ~5s band"
         );
     }
 
