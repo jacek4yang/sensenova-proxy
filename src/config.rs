@@ -31,6 +31,9 @@ pub mod defaults {
     pub const MODEL_OPEN_SECS: u64 = 30;
     pub const RETRY_AFTER_MAX_SECS: u64 = 120;
     pub const MAX_MODEL_COOLDOWN_SECS: u64 = 86_400;
+    pub const MODEL_MISSING_DISTINCT_GROUPS: usize = 2;
+    pub const MODEL_MISSING_WINDOW_SECS: u64 = 300;
+    pub const MODEL_MISSING_COOLDOWN_SECS: u64 = 3_600;
     pub const HARD_PROFILE: &str = "claude-coding-hard";
     pub const FAST_PROFILE: &str = "claude-coding-fast";
 }
@@ -178,6 +181,16 @@ pub struct RoutingConfig {
     pub retry_after_max_secs: u64,
     /// Upper bound for a route/model cooldown (also caps parsed hints).
     pub max_model_cooldown_secs: u64,
+    /// Distinct quota groups that must return 404 for a model inside
+    /// `model_missing_window_secs` before the model itself is treated as
+    /// missing. `2` means one account's entitlement can never disable a model
+    /// globally by itself.
+    pub model_missing_distinct_groups: usize,
+    pub model_missing_window_secs: u64,
+    /// How long a model-wide missing state lasts before it recovers (and the
+    /// routes are probed again). Bounded recovery keeps transient catalog
+    /// changes from requiring a process restart.
+    pub model_missing_cooldown_secs: u64,
     pub profiles: Profiles,
 }
 
@@ -195,6 +208,9 @@ impl Default for RoutingConfig {
             model_open_secs: defaults::MODEL_OPEN_SECS,
             retry_after_max_secs: defaults::RETRY_AFTER_MAX_SECS,
             max_model_cooldown_secs: defaults::MAX_MODEL_COOLDOWN_SECS,
+            model_missing_distinct_groups: defaults::MODEL_MISSING_DISTINCT_GROUPS,
+            model_missing_window_secs: defaults::MODEL_MISSING_WINDOW_SECS,
+            model_missing_cooldown_secs: defaults::MODEL_MISSING_COOLDOWN_SECS,
             profiles: builtin_profiles(),
         }
     }
@@ -212,7 +228,11 @@ pub fn builtin_profiles() -> Profiles {
         defaults::HARD_PROFILE.to_owned(),
         ProfileConfig {
             latency_optimized: false,
-            allow_cross_tier_fallback: false,
+            // Kimi is a legitimate hard-quality resilience fallback: when every
+            // tier-0 route is temporarily unavailable, use it instead of
+            // sleeping. The hard/fast boundary is untouched — fast models are
+            // not in this profile's tier list at all.
+            allow_lower_tier_on_unavailable: true,
             tiers: vec![
                 TierConfig {
                     models: vec!["glm-5.2".into(), "deepseek-v4-pro".into()],
@@ -227,7 +247,7 @@ pub fn builtin_profiles() -> Profiles {
         defaults::FAST_PROFILE.to_owned(),
         ProfileConfig {
             latency_optimized: true,
-            allow_cross_tier_fallback: false,
+            allow_lower_tier_on_unavailable: false,
             tiers: vec![TierConfig {
                 models: vec![
                     "deepseek-v4-flash".into(),
@@ -241,16 +261,58 @@ pub fn builtin_profiles() -> Profiles {
 
 pub type Profiles = std::collections::BTreeMap<String, ProfileConfig>;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ProfileConfig {
     /// Fast profiles score candidates by observed TTFT/latency; hard profiles
-    /// only use health and load inside the same quality tier.
+    /// only use health and load inside the same quality tier. Evaluated from
+    /// the *active* profile — the same model listed in two profiles is scored
+    /// by each profile's own policy.
     pub latency_optimized: bool,
-    /// When false (the default, and mandatory for the hard profile) a failing
-    /// tier never falls through to a weaker model: the proxy fails honestly.
-    pub allow_cross_tier_fallback: bool,
+    /// Whether a temporarily unavailable higher tier — routes cooling, a model
+    /// circuit open, a quota group cooled — may fall through to the next tier
+    /// *of the same profile* instead of waiting. Profile boundaries stay
+    /// absolute: even with this enabled, the hard profile can never reach a
+    /// fast model, because the fast models are simply not in its tier list.
+    ///
+    /// Renamed from `allow_cross_tier_fallback`, which is still accepted as a
+    /// deprecated alias with the same meaning.
+    pub allow_lower_tier_on_unavailable: bool,
     pub tiers: Vec<TierConfig>,
+}
+
+impl<'de> Deserialize<'de> for ProfileConfig {
+    // Manual impl because `deny_unknown_fields` cannot be combined with
+    // `serde(alias)`: the deprecated `allow_cross_tier_fallback` name must be
+    // accepted *and* genuinely unknown fields must still be rejected.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            latency_optimized: bool,
+            allow_lower_tier_on_unavailable: Option<bool>,
+            allow_cross_tier_fallback: Option<bool>,
+            tiers: Vec<TierConfig>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.allow_lower_tier_on_unavailable.is_some() && raw.allow_cross_tier_fallback.is_some()
+        {
+            return Err(serde::de::Error::custom(
+                "profile sets both allow_lower_tier_on_unavailable and the deprecated \
+                 allow_cross_tier_fallback; use allow_lower_tier_on_unavailable only",
+            ));
+        }
+        Ok(Self {
+            latency_optimized: raw.latency_optimized,
+            allow_lower_tier_on_unavailable: raw
+                .allow_lower_tier_on_unavailable
+                .or(raw.allow_cross_tier_fallback)
+                .unwrap_or(false),
+            tiers: raw.tiers,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -555,6 +617,20 @@ impl Config {
         {
             bail!("routing.max_model_cooldown_secs must be between 1 and one year");
         }
+        if routing.model_missing_distinct_groups == 0 || routing.model_missing_distinct_groups > 16
+        {
+            bail!(
+                "routing.model_missing_distinct_groups must be between 1 and 16                  (2 means one account's entitlement can never disable a model)"
+            );
+        }
+        if routing.model_missing_window_secs == 0 || routing.model_missing_window_secs > 86_400 {
+            bail!("routing.model_missing_window_secs must be between 1 and 86400");
+        }
+        if routing.model_missing_cooldown_secs == 0
+            || routing.model_missing_cooldown_secs > 366 * 24 * 3_600
+        {
+            bail!("routing.model_missing_cooldown_secs must be between 1 and one year");
+        }
 
         if routing.profiles.is_empty() {
             // Absent profiles fall back to the built-in hard/fast pair.
@@ -567,9 +643,9 @@ impl Config {
             if profile.tiers.is_empty() {
                 bail!("routing.profiles.{name}.tiers must not be empty");
             }
-            if profile.allow_cross_tier_fallback && profile.tiers.len() < 2 {
+            if profile.allow_lower_tier_on_unavailable && profile.tiers.len() < 2 {
                 bail!(
-                    "routing.profiles.{name}.allow_cross_tier_fallback is meaningless with a single tier"
+                    "routing.profiles.{name}.allow_lower_tier_on_unavailable is meaningless with a single tier"
                 );
             }
             let mut seen: HashSet<&str> = HashSet::new();
@@ -772,8 +848,8 @@ mod tests {
         assert_eq!(hard.tiers[0].models, vec!["glm-5.2", "deepseek-v4-pro"]);
         assert_eq!(hard.tiers[1].models, vec!["kimi-k3"]);
         assert!(
-            !hard.allow_cross_tier_fallback,
-            "the hard profile must never degrade silently"
+            hard.allow_lower_tier_on_unavailable,
+            "tier-1 Kimi is a legitimate hard-quality fallback when tier 0 is unavailable"
         );
         let fast = &profiles["claude-coding-fast"];
         assert!(fast.latency_optimized);
@@ -781,6 +857,23 @@ mod tests {
         assert_eq!(
             fast.tiers[0].models,
             vec!["deepseek-v4-flash", "sensenova-6.8-flash-lite"]
+        );
+        // Profile boundaries stay absolute regardless of the fallback flag:
+        // the fast models are not in the hard tier list at all.
+        let hard_models: Vec<&String> = hard
+            .tiers
+            .iter()
+            .flat_map(|tier| tier.models.iter())
+            .collect();
+        assert!(
+            !hard_models
+                .iter()
+                .any(|model| *model == "deepseek-v4-flash")
+        );
+        assert!(
+            !hard_models
+                .iter()
+                .any(|model| *model == "sensenova-6.8-flash-lite")
         );
         // The aliases route Claude Code's model names at the profiles.
         assert_eq!(
@@ -815,7 +908,10 @@ mod tests {
                 "{model} must not be in the hard pool"
             );
         }
-        assert!(!hard.allow_cross_tier_fallback);
+        // The hard profile allows lower-tier fallback on unavailability, but
+        // never crosses into the fast pool: the pools are disjoint.
+        assert!(hard.allow_lower_tier_on_unavailable);
+        assert!(!fast.allow_lower_tier_on_unavailable);
         assert!(fast.latency_optimized);
     }
 
@@ -855,7 +951,7 @@ mod tests {
             "broken".into(),
             ProfileConfig {
                 latency_optimized: false,
-                allow_cross_tier_fallback: false,
+                allow_lower_tier_on_unavailable: false,
                 tiers: Vec::new(),
             },
         );
@@ -867,7 +963,7 @@ mod tests {
             "broken".into(),
             ProfileConfig {
                 latency_optimized: false,
-                allow_cross_tier_fallback: false,
+                allow_lower_tier_on_unavailable: false,
                 tiers: vec![TierConfig { models: Vec::new() }],
             },
         );
@@ -879,7 +975,7 @@ mod tests {
             "broken".into(),
             ProfileConfig {
                 latency_optimized: false,
-                allow_cross_tier_fallback: true,
+                allow_lower_tier_on_unavailable: true,
                 tiers: vec![
                     TierConfig {
                         models: vec!["dupe".into()],
@@ -899,13 +995,70 @@ mod tests {
             "broken".into(),
             ProfileConfig {
                 latency_optimized: false,
-                allow_cross_tier_fallback: true,
+                allow_lower_tier_on_unavailable: true,
                 tiers: vec![TierConfig {
                     models: vec!["only".into()],
                 }],
             },
         );
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn deprecated_cross_tier_alias_is_accepted_and_renamed_field_wins() {
+        let mut config = valid_config();
+        let profile: ProfileConfig = serde_json::from_value(serde_json::json!({
+            "latency_optimized": false,
+            "allow_cross_tier_fallback": true,
+            "tiers": [
+                {"models": ["a"]},
+                {"models": ["b"]}
+            ]
+        }))
+        .expect("the deprecated alias must still parse");
+        assert!(profile.allow_lower_tier_on_unavailable);
+        config.routing.profiles.insert("legacy".into(), profile);
+        config.validate().unwrap();
+        assert!(
+            config.profiles()["legacy"].allow_lower_tier_on_unavailable,
+            "the deprecated name keeps its meaning"
+        );
+    }
+
+    #[test]
+    fn profiles_reject_setting_both_fallback_names() {
+        let parsed: std::result::Result<ProfileConfig, _> =
+            serde_json::from_value(serde_json::json!({
+                "latency_optimized": false,
+                "allow_cross_tier_fallback": true,
+                "allow_lower_tier_on_unavailable": false,
+                "tiers": [{"models": ["a"]}]
+            }));
+        assert!(
+            parsed.is_err(),
+            "ambiguous dual specification must be rejected"
+        );
+    }
+
+    #[test]
+    fn model_missing_bounds_are_validated() {
+        for mutate in [
+            |routing: &mut RoutingConfig| routing.model_missing_distinct_groups = 0,
+            |routing: &mut RoutingConfig| routing.model_missing_distinct_groups = 99,
+            |routing: &mut RoutingConfig| routing.model_missing_window_secs = 0,
+            |routing: &mut RoutingConfig| routing.model_missing_window_secs = 999_999,
+            |routing: &mut RoutingConfig| routing.model_missing_cooldown_secs = 0,
+        ] {
+            let mut config = valid_config();
+            mutate(&mut config.routing);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("routing.model_missing_"),
+                "unexpected error: {error}"
+            );
+            assert!(!error.contains("sensenova-secret"));
+            assert!(!error.contains("gateway-secret"));
+        }
     }
 
     #[test]
@@ -958,7 +1111,7 @@ mod tests {
             "solo".into(),
             ProfileConfig {
                 latency_optimized: true,
-                allow_cross_tier_fallback: false,
+                allow_lower_tier_on_unavailable: false,
                 tiers: vec![TierConfig {
                     models: vec!["one-model".into()],
                 }],

@@ -48,25 +48,39 @@ is unusable, and only when the profile sets `allow_cross_tier_fallback`.
 
 The built-in pair:
 
-| Profile | Tier 0 | Tier 1 | `latency_optimized` | `allow_cross_tier_fallback` |
-| ------- | ------ | ------ | ------------------- | --------------------------- |
-| `claude-coding-hard` | `glm-5.2`, `deepseek-v4-pro` | `kimi-k3` | false | false |
-| `claude-coding-fast` | `deepseek-v4-flash`, `sensenova-6.8-flash-lite` | — | true | false |
+| Profile | Tier 0 | Tier 1 | `latency_optimized` | `allow_lower_tier_on_unavailable` |
+| ------- | ------ | ------ | ------------------- | -------------------------------- |
+| `claude-coding-hard` | `glm-5.2`, `deepseek-v4-pro` | `kimi-k3` | false | **true** |
+| `claude-coding-fast` | `deepseek-v4-flash`, `sensenova-6.8-flash-lite` | — | true | n/a (single tier) |
 
 Consequences, all covered by tests:
 
 - The hard pool **cannot** reach `deepseek-v4-flash` or
   `sensenova-6.8-flash-lite`; they are not in the profile.
 - The fast pool **cannot** reach `glm-5.2`, `deepseek-v4-pro`, or `kimi-k3`.
-- A healthy tier-0 route always beats a tier-1 route.
-- When every hard route is unusable, the client gets an honest error. There is
-  no silent quality degradation.
+- A healthy tier-0 route always beats a tier-1 route — never on latency, never
+  on load.
+- When every tier-0 route is **temporarily unavailable** (route cooldown, open
+  model circuit, cooled quota group, waiting-out key), the hard profile falls
+  through to tier 1: `kimi-k3` is part of the hard pool and is a legitimate
+  resilience fallback. No sleeping while a healthy hard route exists.
+- When every hard route *at every tier* is unusable, the client gets an honest
+  error. There is no silent quality degradation into the fast pool.
 
-`allow_cross_tier_fallback` is about **quality**, not about cooling: when it is
-false, a tier is only left behind when it is genuinely blocked (a disabled
-model or a dead credential). A tier that is merely *cooling* reports its wait
-instead, so the caller can sleep and retry the same quality rather than
-downgrade.
+### `allow_lower_tier_on_unavailable`
+
+This profile-level flag (renamed from the deprecated `allow_cross_tier_fallback`,
+which is still accepted with the same meaning) governs exactly one thing:
+whether a *temporarily unavailable* tier may fall through to the next tier of
+the **same profile**.
+
+- It does **not** weaken profile boundaries. Tier fallback only ever walks the
+  tier list of the profile being routed; the hard profile can never reach a
+  fast model because the fast models are not in its tier list, whatever the
+  flag says.
+- `false` means the old conservative behaviour: a cooling tier reports its
+  wait and the request waits (bounded) rather than degrade.
+- Setting both names in one profile is rejected at startup.
 
 ## Failure domains
 
@@ -76,7 +90,7 @@ downgrade.
 | Explicit quota exhaustion (`FREE_QUOTA_EXHAUSTED` and equivalent quota wording, *observed*) | the whole `quota_group` | every key and every model on that account |
 | 401 | that credential | that key only |
 | 403 | nothing; failover only | 403 may be model-level, so no evidence-based condemnation |
-| 404 model not found | that model route, latched | that model on this deployment |
+| 404 model not found | that `(model, quota_group)` route, long bounded cooldown | the same model on other accounts |
 | 5xx / transport / EOF before the first byte / first-byte timeout | the `(model, quota_group)` route, briefly | the failing route |
 
 `quota_group` is the account-level failure domain: keys inside one group are
@@ -103,6 +117,45 @@ The circuit is Closed → Open → HalfOpen → Closed:
 The proxy-wide circuit in `src/circuit.rs` is separate and much blunter: it
 exists for a proxy-wide upstream outage and for quota exhaustion with no usable
 route left. A single model's circuit never blocks healthy models.
+
+### Model-missing (404) evidence
+
+Model availability and entitlement may differ **per account**, so one 404 is
+only route-level evidence. The model-wide missing state requires 404s from
+`model_missing_distinct_groups` (**default 2**) distinct quota groups inside
+`model_missing_window_secs` (**default 300 s**):
+
+```
+glm-5.2 / account-A -> 404  => route (glm-5.2, A) disabled
+glm-5.2 / account-B -> 200  => model stays globally healthy
+glm-5.2 / A -> 404, glm-5.2 / B -> 404 (inside the window)
+                            => model disabled
+```
+
+- Repeated 404s from **one** group never count as distinct evidence: they
+  refresh a single bounded entry.
+- The route-level disable means a known-missing route is never re-dialed.
+- The model-wide state **recovers** after `model_missing_cooldown_secs`
+  (**default 1 h**) and is cleared immediately by any success — a transient
+  catalog change never requires a process restart.
+- A single-group deployment cannot fabricate cross-group evidence: one 404
+  disables the only route, the request falls back to the next tier or fails
+  honestly, and the model is *not* marked globally missing.
+
+### `model_circuit_open_total` semantics
+
+The counter increments **exactly once per transition into Open**:
+
+| Transition | Counter |
+| ---------- | ------- |
+| Closed → Open | +1 |
+| more failures while Open | unchanged |
+| Open → HalfOpen | unchanged |
+| HalfOpen → Closed (successful probe) | unchanged |
+| HalfOpen → Open (failed probe) | +1 |
+
+The transition logic lives in one place (`RouteTable`'s circuit transition
+helper), so double counting across failover paths is structurally impossible.
 
 ## 429 behaviour
 
@@ -295,6 +348,9 @@ and raw session identifiers are never logged. Existing metrics
   "model_trip_distinct_groups": 2,
   "model_trip_window_secs": 20,
   "model_open_secs": 30,
+  "model_missing_distinct_groups": 2,
+  "model_missing_window_secs": 300,
+  "model_missing_cooldown_secs": 3600,
   "retry_after_max_secs": 120,
   "max_model_cooldown_secs": 86400,
   "profiles": {
@@ -326,13 +382,18 @@ and raw session identifiers are never logged. Existing metrics
 | `model_trip_distinct_groups` | 2 | 1–16 |
 | `model_trip_window_secs` | 20 | 1–3600 |
 | `model_open_secs` | 30 | 1–3600 |
+| `model_missing_distinct_groups` | 2 | 1–16 |
+| `model_missing_window_secs` | 300 | 1–86400 |
+| `model_missing_cooldown_secs` | 3600 | 1–one year |
 | `retry_after_max_secs` | 120 | 1–3600 |
 | `max_model_cooldown_secs` | 86400 | 1–one year |
 
 Validation rejects unknown fields anywhere, empty profile/tier/model lists, a
-model listed in two tiers of one profile, `allow_cross_tier_fallback` on a
-single-tier profile, zero or impossible durations, and out-of-range bounds.
-Errors name the field (and profile/tier index) only and never echo a value.
+model listed in two tiers of one profile, `allow_lower_tier_on_unavailable` on
+a single-tier profile, zero or impossible durations, and out-of-range bounds.
+The deprecated `allow_cross_tier_fallback` name is still accepted (same
+meaning); setting both names in one profile is rejected. Errors name the field
+(and profile/tier index) only and never echo a value.
 
 `routing` itself is optional; omitting it selects the built-in hard/fast pair,
 so existing configurations keep working unchanged.
@@ -343,7 +404,8 @@ These are the rules the implementation must never break, and each has a test:
 
 1. No retry, failover, account switch or model switch after the downstream
    commit.
-2. The hard profile never silently falls into a fast model.
+2. The hard profile never silently falls into a fast model (tier fallback
+   within the hard pool is fine and expected; profile boundaries are absolute).
 3. One 429 cannot globally disable a model.
 4. A model-wide circuit requires failures from distinct quota groups.
 5. One account's failure cannot stop other accounts.

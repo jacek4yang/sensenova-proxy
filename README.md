@@ -136,14 +136,16 @@ fields are rejected at startup.
     "model_trip_distinct_groups": 2, "model_trip_window_secs": 20,
     "model_open_secs": 30, "retry_after_max_secs": 120,
     "max_model_cooldown_secs": 86400,
+    "model_missing_distinct_groups": 2, "model_missing_window_secs": 300,
+    "model_missing_cooldown_secs": 3600,
     "profiles": {
       "claude-coding-hard": {
-        "latency_optimized": false, "allow_cross_tier_fallback": false,
+        "latency_optimized": false, "allow_lower_tier_on_unavailable": true,
         "tiers": [ { "models": ["glm-5.2", "deepseek-v4-pro"] },
                    { "models": ["kimi-k3"] } ]
       },
       "claude-coding-fast": {
-        "latency_optimized": true, "allow_cross_tier_fallback": false,
+        "latency_optimized": true, "allow_lower_tier_on_unavailable": false,
         "tiers": [ { "models": ["deepseek-v4-flash", "sensenova-6.8-flash-lite"] } ]
       }
     }
@@ -167,9 +169,12 @@ and invalid tracing filters.
 
 The `routing` section is validated just as strictly: unknown fields anywhere
 (including inside a profile), empty profile/tier/model lists, a model listed in
-two tiers of the same profile, `allow_cross_tier_fallback` on a single-tier
-profile, zero or impossible durations, `route_cooldown_initial_secs >
-route_cooldown_max_secs`, and out-of-range bounds are all rejected at startup.
+two tiers of the same profile, `allow_lower_tier_on_unavailable` on a
+single-tier profile, zero or impossible durations, `route_cooldown_initial_secs
+> route_cooldown_max_secs`, and out-of-range bounds are all rejected at
+startup. The deprecated `allow_cross_tier_fallback` name is still accepted
+with the same meaning as `allow_lower_tier_on_unavailable`; setting both is
+rejected.
 Validation errors identify the offending field (and profile/tier index) only,
 and never print key values.
 
@@ -225,12 +230,16 @@ Isolation is absolute:
 
 - **`claude-coding-hard` never selects `deepseek-v4-flash` or
   `sensenova-6.8-flash-lite`.** They are not in the profile, so no failure
-  pattern can reach them.
-- **Quality outranks latency, always.** Tier 0 is exhausted (all routes
-  hard-failed) before tier 1 is considered — a faster model is never chosen
-  over a higher-quality one that is merely slower.
-- **If every hard route fails, you get an honest failure**, never a silent
-  downgrade to a weak model.
+  pattern can reach them — including tier fallback.
+- **Quality outranks latency, always.** A healthy tier-0 route is chosen over
+  tier 1 regardless of latency or load.
+- **Kimi is a legitimate hard-quality fallback.** When every tier-0 route is
+  *temporarily unavailable* — cooling, model circuit open, cooled account —
+  the hard profile immediately uses healthy `kimi-k3` instead of sleeping.
+  Profile boundaries are untouched: tier fallback only walks the hard
+  profile's own tier list.
+- **If every hard route at every tier fails, you get an honest failure**,
+  never a silent downgrade to a weak model.
 - `claude-coding-fast` contains only fast models; it can never reach a
   quality model.
 
@@ -263,7 +272,7 @@ Every failure cools exactly the thing that failed — never more:
 | Generic 429 (TPM/capacity) | one `(model, quota_group)` route | the same model on another account; another model on the same account |
 | Explicit quota exhaustion (`FREE_QUOTA_EXHAUSTED`) | the whole `quota_group` | other quota groups and other models |
 | 401 | that one credential | siblings in the same quota group |
-| 404 model not found | that model (latched) | other models |
+| 404 model not found | that `(model, quota_group)` route | the same model on other accounts |
 | 5xx / transport / EOF before first byte | the `(model, quota_group)` route, briefly | everything else |
 
 A **model-wide circuit** opens only when qualifying failures arrive from
@@ -271,7 +280,17 @@ A **model-wide circuit** opens only when qualifying failures arrive from
 inside `routing.model_trip_window_secs` (default **20 s**). One failing account
 can therefore never globally disable a model; the model is also half-open
 probed after `routing.model_open_secs` (default **30 s**) and closes again on a
-successful probe.
+successful probe. `model_circuit_open_total` increments exactly once per
+transition into Open (and once per failed-probe re-open) — never for repeated
+failures while already open.
+
+A **404** is account-scoped evidence: the first 404 disables only that
+`(model, quota_group)` route, because entitlement may differ across accounts.
+The model itself is treated as missing only after 404s from
+`routing.model_missing_distinct_groups` (default **2**) distinct quota groups
+inside `routing.model_missing_window_secs` (default **300 s**), and that state
+recovers after `routing.model_missing_cooldown_secs` (default **1 h**) or
+immediately on any success — no restart required.
 
 ### 429 behaviour
 
