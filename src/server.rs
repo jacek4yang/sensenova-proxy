@@ -109,15 +109,22 @@ async fn readyz_protected(State(state): State<AppState>, headers: HeaderMap) -> 
 }
 
 fn readyz_impl(state: AppState) -> Response {
-    let usable = state.core.pool.usable_count();
+    let usable_routes = state.core.routes.usable_route_count();
+    let total_routes = state.core.routes.all_candidates().len();
+    let healthy_credentials = state.core.routes.usable_credential_count();
     let circuit = state.core.circuit.state();
     state
         .metrics
         .set_circuit_state(circuit_code(&state, circuit));
-    let ready = usable > 0;
+    // Ready while at least one legal route exists: one unhealthy model or one
+    // bad credential must not take the whole proxy out of service.
+    let ready = usable_routes > 0;
     let body = json!({
         "status": if ready { "ready" } else { "not_ready" },
-        "usable_credentials": usable,
+        "usable_routes": usable_routes,
+        "total_routes": total_routes,
+        "usable_credentials": healthy_credentials,
+        "usable_credentials_raw": state.core.pool.usable_count(),
         "circuit_state": circuit.as_str(),
         "circuit_open_remaining_secs": state.core.circuit.open_remaining()
             .map(|(remaining, _)| remaining.as_secs()),
@@ -242,7 +249,29 @@ async fn anthropic_messages(
             &request_id,
         );
     };
-    let upstream_model = models::resolve_model(&state.config, &client_model);
+    // Resolve the client's virtual model through the routing profiles. A
+    // literal (catalog ID or default-mapped Claude name) is normalized here;
+    // a profile request keeps its canonical body and the final upstream model
+    // is chosen per attempt by the router.
+    let resolved = state
+        .core
+        .routes
+        .resolve(&state.config.models, &client_model);
+    let spec = match &resolved {
+        crate::router::Resolution::Profile(profile) => {
+            crate::router::RouteSpec::Profile(profile.clone())
+        }
+        crate::router::Resolution::Literal(model) => {
+            crate::router::RouteSpec::Literal(model.clone())
+        }
+    };
+    let profile = spec.label().to_owned();
+    // A literal request keeps its model in the body; a profile request has its
+    // model patched per attempt, so the placeholder is never sent as-is.
+    let upstream_model = match &resolved {
+        crate::router::Resolution::Profile(_) => String::new(),
+        crate::router::Resolution::Literal(model) => model.clone(),
+    };
     if let Err(error) = models::normalize_messages_request(&mut value, &upstream_model) {
         return anthropic_error(
             StatusCode::BAD_REQUEST,
@@ -251,7 +280,10 @@ async fn anthropic_messages(
             &request_id,
         );
     }
-    let upstream_body = match serde_json::to_vec(&value) {
+    // The canonical body: model-rewritten only for literal requests. Routing
+    // profiles patch the model per attempt, so this body is never mutated
+    // again after serialization.
+    let canonical = match serde_json::to_vec(&value) {
         Ok(body) => Bytes::from(body),
         Err(_) => {
             return anthropic_error(
@@ -265,7 +297,7 @@ async fn anthropic_messages(
     let session_tag = session_tag(&headers);
     // Serving-pressure observability only (never used to reject): large
     // input plus a large output budget is what trips upstream TPM limits.
-    let approx_input_tokens = models::approximate_input_tokens(&upstream_body).unwrap_or(0);
+    let approx_input_tokens = models::approximate_input_tokens(&canonical).unwrap_or(0);
     let requested_max_tokens = value.get("max_tokens").and_then(Value::as_u64);
 
     // Bounded local admission: no unbounded queue exists.
@@ -318,10 +350,11 @@ async fn anthropic_messages(
         request_id,
         protocol = "anthropic",
         client_model,
+        profile,
         upstream_model,
         session_tag,
         stream,
-        request_bytes = upstream_body.len(),
+        request_bytes = canonical.len(),
         approx_input_tokens,
         requested_max_tokens,
         queue_wait_ms = permit.queue_wait.as_millis() as u64,
@@ -332,21 +365,25 @@ async fn anthropic_messages(
         .core
         .send_messages(
             &state.metrics,
-            upstream_body,
             stream,
             &request_id,
             &client_model,
-            &upstream_model,
+            &canonical,
             &session_tag,
+            &spec,
         )
         .await;
 
     match result {
-        Ok(UpstreamOutcome::Json { body, key, attempt }) => {
+        Ok(UpstreamOutcome::Json {
+            body,
+            target,
+            attempt,
+        }) => {
             let tool_calls = serde_json::from_slice::<Value>(&body)
                 .map(|value| models::count_tool_use_blocks(&value))
                 .unwrap_or(0);
-            scope.finish_json(&key, attempt, tool_calls);
+            scope.finish_json(&target.key, attempt, tool_calls);
             let mut response = (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
@@ -359,12 +396,14 @@ async fn anthropic_messages(
         Ok(UpstreamOutcome::Stream {
             first_chunk,
             rest,
-            key,
+            target,
             attempt,
         }) => {
             tracing::info!(
                 request_id,
-                credential = %key.name,
+                model = target.model_str(),
+                tier = target.tier,
+                credential = %target.key.name,
                 attempt,
                 "stream committed to client; replay disabled from here on"
             );
@@ -378,7 +417,7 @@ async fn anthropic_messages(
                     rest: Some(rest),
                     decoder: SseDecoder::default(),
                     request_id: request_id.clone(),
-                    credential: key.name.to_string(),
+                    credential: target.key.name.to_string(),
                     session_tag,
                     ping_interval: ping_interval(state.config.runtime.stream_ping_secs),
                     permit,

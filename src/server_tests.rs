@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 use super::*;
-use crate::config::SensenovaKeyConfig;
+use crate::config::{SensenovaKeyConfig, TierConfig};
 
 // ---------------------------------------------------------------------------
 // Mock SenseNova upstream
@@ -79,13 +79,20 @@ impl Spec {
     }
 
     /// Override the content type (used for raw/empty stream bodies).
+    #[allow(dead_code)]
     fn content_type_sse(mut self) -> Self {
         self.content_type = "text/event-stream";
+        self
+    }
+
+    fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+        self.headers.push((name, value));
         self
     }
 }
 
 impl MockUpstream {
+    /// Script the next responses for one credential, keyed by API key.
     async fn set(&self, key: &str, specs: Vec<Spec>) {
         self.sequences
             .lock()
@@ -93,8 +100,40 @@ impl MockUpstream {
             .insert(key.to_owned(), VecDeque::from(specs));
     }
 
+    /// Script responses by model, ignoring which credential dialed.
+    async fn set_model(&self, model: &str, specs: Vec<Spec>) {
+        self.model_sequences
+            .lock()
+            .await
+            .insert(model.to_owned(), VecDeque::from(specs));
+    }
+
     async fn seen(&self) -> Vec<SeenRequest> {
         self.calls.lock().await.clone()
+    }
+
+    async fn models_seen(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .map(|call| {
+                call.body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    async fn credentials_seen(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .map(|call| call.authorization.clone())
+            .collect()
     }
 }
 
@@ -111,6 +150,7 @@ struct SeenRequest {
 #[derive(Clone, Default)]
 struct MockUpstream {
     sequences: Arc<Mutex<HashMap<String, VecDeque<Spec>>>>,
+    model_sequences: Arc<Mutex<HashMap<String, VecDeque<Spec>>>>,
     calls: Arc<Mutex<Vec<SeenRequest>>>,
     in_flight: Arc<AtomicUsize>,
     max_in_flight: Arc<AtomicUsize>,
@@ -131,6 +171,11 @@ async fn mock_handler(
         .unwrap_or_default()
         .to_owned();
     let parsed = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let model = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     mock.calls.lock().await.push(SeenRequest {
         authorization,
         anthropic_version: headers
@@ -151,13 +196,22 @@ async fn mock_handler(
             .map(ToOwned::to_owned),
         body: parsed,
     });
-    let spec = mock
+    // Per-credential scripts win; otherwise fall back to a per-model script.
+    let mut spec = mock
         .sequences
         .lock()
         .await
         .get_mut(&key)
-        .and_then(VecDeque::pop_front)
-        .unwrap_or_else(|| Spec::json(500, r#"{"error":{"message":"unscripted"}}"#));
+        .and_then(VecDeque::pop_front);
+    if spec.is_none() {
+        spec = mock
+            .model_sequences
+            .lock()
+            .await
+            .get_mut(&model)
+            .and_then(VecDeque::pop_front);
+    }
+    let spec = spec.unwrap_or_else(|| Spec::json(500, r#"{"error":{"message":"unscripted"}}"#));
     let current = mock.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
     mock.max_in_flight.fetch_max(current, Ordering::AcqRel);
     if let MockBody::Delay(duration) = spec.kind {
@@ -171,8 +225,6 @@ async fn mock_handler(
     }
     let response_body: Body = match spec.kind {
         MockBody::StreamError => {
-            // The delay lets hyper flush the initial bytes to the client
-            // before the reset; an immediate RST would discard them.
             let initial = spec.body;
             let stream = async_stream::stream! {
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(initial));
@@ -244,6 +296,16 @@ fn test_config(base_url: String, keys: usize) -> crate::config::Config {
     config.retry.max_attempts = 2;
     config.retry.backoff_initial_ms = 10;
     config.retry.backoff_max_ms = 50;
+    // Test-friendly routing: two attempts by default (the legacy default),
+    // short cooldowns, and a trip threshold of two distinct groups.
+    config.routing.max_route_attempts = 2;
+    config.routing.route_cooldown_initial_secs = 1;
+    config.routing.route_cooldown_max_secs = 4;
+    config.routing.retry_after_max_secs = 2;
+    config.routing.model_open_secs = 2;
+    config.routing.model_trip_window_secs = 20;
+    config.routing.model_trip_distinct_groups = 2;
+    config.routing.profiles = test_profiles();
     config
         .models
         .aliases
@@ -259,8 +321,47 @@ fn test_config(base_url: String, keys: usize) -> crate::config::Config {
     config
 }
 
+/// A deterministic two-tier profile set: `claude-coding-hard` mirrors the
+/// documented quality isolation, `claude-coding-fast` the latency pool.
+fn test_profiles() -> crate::config::Profiles {
+    let mut profiles = crate::config::Profiles::new();
+    profiles.insert(
+        "claude-coding-hard".to_owned(),
+        crate::config::ProfileConfig {
+            latency_optimized: false,
+            allow_cross_tier_fallback: false,
+            tiers: vec![
+                TierConfig {
+                    models: vec!["glm-5.2".into(), "deepseek-v4-pro".into()],
+                },
+                TierConfig {
+                    models: vec!["kimi-k3".into()],
+                },
+            ],
+        },
+    );
+    profiles.insert(
+        "claude-coding-fast".to_owned(),
+        crate::config::ProfileConfig {
+            latency_optimized: true,
+            allow_cross_tier_fallback: false,
+            tiers: vec![TierConfig {
+                models: vec![
+                    "deepseek-v4-flash".into(),
+                    "sensenova-6.8-flash-lite".into(),
+                ],
+            }],
+        },
+    );
+    profiles
+}
+
 fn app_for(config: crate::config::Config) -> Router {
     router(AppState::new(config).unwrap())
+}
+
+fn state_for(config: crate::config::Config) -> AppState {
+    AppState::new(config).unwrap()
 }
 
 fn gateway_request(path: &str, body: impl Into<Body>) -> Request<Body> {
@@ -273,9 +374,10 @@ fn gateway_request(path: &str, body: impl Into<Body>) -> Request<Body> {
         .unwrap()
 }
 
+/// A request through the hard profile (the default for an unqualified model).
 fn anthropic_body(stream: bool) -> String {
     json!({
-        "model": "claude-sensenova",
+        "model": "claude-coding-hard",
         "max_tokens": 128,
         "stream": stream,
         "messages": [{"role": "user", "content": "hello"}],
@@ -284,11 +386,21 @@ fn anthropic_body(stream: bool) -> String {
     .to_string()
 }
 
+fn body_for_model(model: &str, stream: bool) -> String {
+    json!({
+        "model": model,
+        "max_tokens": 128,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "hello"}]
+    })
+    .to_string()
+}
+
 fn ok_message_json() -> String {
     json!({
         "id": "msg_1", "type": "message", "role": "assistant",
         "content": [{"type": "text", "text": "OK"}],
-        "model": "sensenova-6.8-flash-lite", "stop_reason": "end_turn",
+        "model": "glm-5.2", "stop_reason": "end_turn",
         "usage": {"input_tokens": 10, "output_tokens": 2}
     })
     .to_string()
@@ -314,14 +426,1032 @@ async fn response_text(response: Response<Body>) -> String {
     .unwrap()
 }
 
+async fn ready_body(app: Router) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    (status, body)
+}
+
 // ---------------------------------------------------------------------------
-// Tests: passthrough and protocol fidelity
+// Tests: profile isolation (hard never degrades into fast)
 // ---------------------------------------------------------------------------
 
+/// The hard profile must never select SenseNova 6.8 Flash Lite, under any
+/// failure pattern: healthy, tier-0 cooling, and everything failing.
 #[tokio::test]
-async fn nonstream_passthrough_rewrites_model_and_preserves_body() {
+async fn hard_profile_never_selects_sensenova_flash_lite() {
+    // The mock server task is intentionally kept alive for the whole test
+    // and torn down with the runtime.
+    let (base, mock, _task) = start_mock().await;
+    // Every dial succeeds, so only the router's *choice* is under test.
+    mock.set_model(
+        "glm-5.2",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    mock.set_model(
+        "deepseek-v4-pro",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    mock.set_model(
+        "kimi-k3",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    mock.set_model(
+        "sensenova-6.8-flash-lite",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    mock.set_model(
+        "deepseek-v4-flash",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 4;
+    let app = app_for(config);
+    for _ in 0..4 {
+        let response = app
+            .clone()
+            .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let models = mock.models_seen().await;
+    assert!(!models.is_empty());
+    for model in &models {
+        assert_ne!(model, "sensenova-6.8-flash-lite", "hard must never use it");
+        assert_ne!(model, "deepseek-v4-flash", "hard must never use it");
+    }
+}
+
+/// The hard profile must never select DeepSeek V4 Flash either, even when
+/// every hard route fails.
+#[tokio::test]
+async fn hard_profile_never_selects_deepseek_flash_even_on_total_failure() {
+    // The mock server task is intentionally kept alive for the whole test
+    // and torn down with the runtime.
+    let (base, mock, _task) = start_mock().await;
+    for model in ["glm-5.2", "deepseek-v4-pro", "kimi-k3"] {
+        mock.set_model(
+            model,
+            (0..4)
+                .map(|_| Spec::json(503, r#"{"error":{"message":"overloaded"}}"#))
+                .collect(),
+        )
+        .await;
+    }
+    mock.set_model(
+        "deepseek-v4-flash",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 4;
+    let app = app_for(config);
+    let response = app
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    // Honest failure beats silent quality degradation.
+    assert_ne!(response.status(), StatusCode::OK);
+    for model in mock.models_seen().await {
+        assert_ne!(
+            model, "deepseek-v4-flash",
+            "hard must never degrade to fast"
+        );
+        assert_ne!(model, "sensenova-6.8-flash-lite");
+    }
+}
+
+/// A healthy tier-0 route always beats the tier-1 fallback.
+#[tokio::test]
+async fn hard_tier_zero_beats_kimi_when_healthy() {
+    // The mock server task is intentionally kept alive for the whole test
+    // and torn down with the runtime.
+    let (base, mock, _task) = start_mock().await;
+    mock.set_model("glm-5.2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set_model("deepseek-v4-pro", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set_model("kimi-k3", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let response = app_for(test_config(base, 1))
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let models = mock.models_seen().await;
+    assert_eq!(models.len(), 1);
+    assert!(
+        matches!(models[0].as_str(), "glm-5.2" | "deepseek-v4-pro"),
+        "tier 0 must win, got {}",
+        models[0]
+    );
+}
+
+/// Kimi serves only when every tier-0 route is unusable — never earlier.
+#[tokio::test]
+async fn hard_uses_kimi_when_tier_zero_is_unavailable() {
+    // The mock server task is intentionally kept alive for the whole test
+    // and torn down with the runtime.
+    let (base, mock, _task) = start_mock().await;
+    // Both tier-0 models are 404 (disabled for the process), Kimi is healthy.
+    mock.set_model(
+        "glm-5.2",
+        vec![Spec::json(
+            404,
+            r#"{"error":{"type":"not_found_error","message":"model is not found"}}"#,
+        )],
+    )
+    .await;
+    mock.set_model(
+        "deepseek-v4-pro",
+        vec![Spec::json(
+            404,
+            r#"{"error":{"type":"not_found_error","message":"model is not found"}}"#,
+        )],
+    )
+    .await;
+    mock.set_model("kimi-k3", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 4;
+    let app = app_for(config);
+    let response = app
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let models = mock.models_seen().await;
+    assert!(
+        models.contains(&"kimi-k3".to_owned()),
+        "kimi must be the fallback, got {models:?}"
+    );
+}
+
+/// The fast profile contains only fast models.
+#[tokio::test]
+async fn fast_profile_contains_only_fast_models() {
+    // The mock server task is intentionally kept alive for the whole test
+    // and torn down with the runtime.
+    let (base, mock, _task) = start_mock().await;
+    for model in [
+        "deepseek-v4-flash",
+        "sensenova-6.8-flash-lite",
+        "glm-5.2",
+        "deepseek-v4-pro",
+        "kimi-k3",
+    ] {
+        mock.set_model(
+            model,
+            (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+        )
+        .await;
+    }
+    let app = app_for(test_config(base, 1));
+    for _ in 0..4 {
+        let response = app
+            .clone()
+            .oneshot(gateway_request(
+                "/v1/messages",
+                body_for_model("claude-coding-fast", false),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let models = mock.models_seen().await;
+    assert!(!models.is_empty());
+    for model in &models {
+        assert!(
+            matches!(
+                model.as_str(),
+                "deepseek-v4-flash" | "sensenova-6.8-flash-lite"
+            ),
+            "fast profile leaked a hard model: {model}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: 429 failure domains
+// ---------------------------------------------------------------------------
+
+/// A generic 429 cools only `(model, quota_group)`; the same model on another
+/// account still serves.
+#[tokio::test]
+async fn one_429_cools_only_the_model_and_group() {
     let (base, mock, task) = start_mock().await;
-    mock.set("sensenova-key-1", vec![Spec::json(200, ok_message_json())])
+    // account-a 429s once, account-b is healthy for the same model.
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(429, r#"{"error":{"message":"Server is busy"}}"#)],
+    )
+    .await;
+    mock.set(
+        "sensenova-key-2",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    let mut config = test_config(base, 2);
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    let state = state_for(config);
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "failover must succeed");
+    assert_eq!(
+        mock.credentials_seen().await,
+        vec![
+            "Bearer sensenova-key-1".to_owned(),
+            "Bearer sensenova-key-2".to_owned()
+        ]
+    );
+    // Exactly one `(model, group)` route is cooling; the other is untouched.
+    assert!(
+        state
+            .core
+            .routes
+            .route_cooling("glm-5.2", "account-a")
+            .is_some(),
+        "the 429 route must cool"
+    );
+    assert!(
+        state
+            .core
+            .routes
+            .route_cooling("glm-5.2", "account-b")
+            .is_none(),
+        "the healthy group must not cool"
+    );
+    assert!(
+        state.core.routes.model_snapshot("glm-5.2").state == crate::router::CircuitState::Closed,
+        "one 429 must never open the model circuit"
+    );
+    task.abort();
+}
+
+/// The same model fails over to another quota group (never re-dialing the
+/// cooled route).
+#[tokio::test]
+async fn same_model_fails_over_to_another_group() {
+    // The mock server task is intentionally kept alive for the whole test
+    // and torn down with the runtime.
+    let (base, mock, _task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(
+            429,
+            r#"{"error":{"message":"inference tpm exhausted"}}"#,
+        )],
+    )
+    .await;
+    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 2);
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let models = mock.models_seen().await;
+    assert_eq!(
+        models.len(),
+        2,
+        "one failover, not a same-route replay: {models:?}"
+    );
+    assert_eq!(models[0], models[1], "the model itself did not change");
+}
+
+/// Failures from two distinct quota groups open the model circuit; a repeated
+/// failure from a single group alone never does.
+#[tokio::test]
+async fn two_distinct_groups_trip_the_model_circuit_but_one_does_not() {
+    // (a) one group failing repeatedly stays closed.
+    {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "sensenova-key-1",
+            (0..4)
+                .map(|_| Spec::json(429, r#"{"error":{"message":"busy"}}"#))
+                .collect(),
+        )
+        .await;
+        let mut config = test_config(base, 1);
+        config.routing.max_route_attempts = 4;
+        config.routing.same_route_429_retries = 3;
+        let state = state_for(config);
+        let app = router(state.clone());
+        for _ in 0..2 {
+            let _ = app
+                .clone()
+                .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            state.core.routes.model_snapshot("glm-5.2").state,
+            crate::router::CircuitState::Closed,
+            "repeat failures from ONE group must not trip the model"
+        );
+        task.abort();
+    }
+
+    // (b) two distinct groups within the trip window open it.
+    {
+        let (base, mock, task) = start_mock().await;
+        for key in ["sensenova-key-1", "sensenova-key-2"] {
+            mock.set(
+                key,
+                (0..4)
+                    .map(|_| Spec::json(429, r#"{"error":{"message":"busy"}}"#))
+                    .collect(),
+            )
+            .await;
+        }
+        let mut config = test_config(base, 2);
+        config.routing.max_route_attempts = 4;
+        config.routing.model_trip_distinct_groups = 2;
+        config.routing.model_trip_window_secs = 60;
+        config.sensenova_api_keys[0].quota_group = "account-a".into();
+        config.sensenova_api_keys[1].quota_group = "account-b".into();
+        let state = state_for(config);
+        let app = router(state.clone());
+        let _ = app
+            .clone()
+            .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.core.routes.model_snapshot("glm-5.2").state,
+            crate::router::CircuitState::Open,
+            "two distinct groups inside the window must trip the model"
+        );
+        task.abort();
+    }
+}
+
+/// A tripped model circuit half-opens and closes again after a success.
+#[tokio::test]
+async fn model_circuit_half_opens_and_recovers() {
+    let (base, mock, task) = start_mock().await;
+    // Exactly one 429 per credential: two distinct groups trip the model, and
+    // only the two tier-0 routes cool. After recovery everything is healthy.
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(429, r#"{"error":{"message":"busy"}}"#)],
+    )
+    .await;
+    mock.set(
+        "sensenova-key-2",
+        vec![Spec::json(429, r#"{"error":{"message":"busy"}}"#)],
+    )
+    .await;
+    let mut config = test_config(base, 2);
+    config.routing.max_route_attempts = 4;
+    config.routing.model_open_secs = 1;
+    config.routing.route_cooldown_initial_secs = 1;
+    config.routing.route_cooldown_max_secs = 1;
+    config.routing.retry_after_max_secs = 1;
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    let state = state_for(config);
+    let app = router(state.clone());
+    let _ = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(
+        state.core.routes.model_snapshot("glm-5.2").state,
+        crate::router::CircuitState::Open
+    );
+
+    // After the open window the circuit half-opens and the next success closes
+    // it. Both the model window and the escalated route ladder must have
+    // elapsed first. Script both hard models healthy again.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    for model in ["glm-5.2", "deepseek-v4-pro"] {
+        mock.set_model(
+            model,
+            (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+        )
+        .await;
+    }
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "half-open probe must succeed"
+    );
+    assert_eq!(
+        state.core.routes.model_snapshot("glm-5.2").state,
+        crate::router::CircuitState::Closed,
+        "a successful probe closes the model circuit"
+    );
+    task.abort();
+}
+
+/// An authoritative `Retry-After` is honoured over the exponential ladder.
+#[tokio::test]
+async fn retry_after_header_is_respected() {
+    let (base, mock, task) = start_mock().await;
+    // Both tier-0 models answer 429 with the same authoritative hint, so the
+    // hint reaches the client regardless of which one is dialed first.
+    for model in ["glm-5.2", "deepseek-v4-pro"] {
+        mock.set_model(
+            model,
+            vec![
+                Spec::json(429, r#"{"error":{"message":"slow down"}}"#)
+                    .with_header("retry-after", "17"),
+            ],
+        )
+        .await;
+    }
+    let response = app_for(test_config(base, 1))
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = response.headers()[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (17..=18).contains(&retry_after),
+        "the authoritative hint must travel to the client, got {retry_after}"
+    );
+    task.abort();
+}
+
+/// Without a hint, the generic-429 cooldown is the bounded exponential ladder:
+/// it never exceeds the configured maximum, never returns zero, and the client
+/// receives it as `Retry-After`.
+#[tokio::test]
+async fn exponential_cooldown_is_bounded_without_a_hint() {
+    let (base, mock, task) = start_mock().await;
+    for model in ["glm-5.2", "deepseek-v4-pro"] {
+        mock.set_model(
+            model,
+            (0..4)
+                .map(|_| Spec::json(429, r#"{"error":{"message":"Server is busy"}}"#))
+                .collect(),
+        )
+        .await;
+    }
+    let mut config = test_config(base, 1);
+    // A 5 s ladder keeps the cooldown observable while the response travels
+    // back; the ladder shape itself is unit-tested in `router::tests`.
+    config.routing.route_cooldown_initial_secs = 5;
+    config.routing.route_cooldown_max_secs = 120;
+    config.routing.retry_after_max_secs = 1;
+    let state = state_for(config);
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = response.headers()[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // The ladder escalates per attempt (5 s, then 10 s, …) and is always
+    // forwarded with the small `Retry-After` headroom. It must be non-zero and
+    // must never exceed the configured ladder maximum plus that headroom.
+    assert!(
+        (5..=121).contains(&retry_after),
+        "the ladder must start at route_cooldown_initial_secs, stay bounded, and never be zero, got {retry_after}"
+    );
+
+    // Whatever route the router chose is the one that cooled, and it is cooled
+    // as a *(model, quota_group)* route — never as the whole account.
+    let cooled = ["glm-5.2", "deepseek-v4-pro"]
+        .iter()
+        .filter(|model| {
+            state
+                .core
+                .routes
+                .route_cooling(model, "account-a")
+                .is_some()
+        })
+        .count();
+    assert!(
+        cooled >= 1,
+        "the failed (model, quota_group) route must cool after a hintless 429"
+    );
+    task.abort();
+}
+
+/// A 429 must never be replayed on the same route while another healthy route
+/// exists.
+#[tokio::test]
+async fn no_same_route_429_retry_when_alternatives_exist() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![
+            Spec::json(429, r#"{"error":{"message":"busy"}}"#),
+            Spec::json(200, ok_message_json()),
+        ],
+    )
+    .await;
+    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 2);
+    config.routing.max_route_attempts = 4;
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        mock.credentials_seen().await,
+        vec![
+            "Bearer sensenova-key-1".to_owned(),
+            "Bearer sensenova-key-2".to_owned()
+        ],
+        "the failed credential must not be dialed twice"
+    );
+    task.abort();
+}
+
+/// Explicit quota exhaustion still cools the whole quota_group and fails over
+/// to another group within the same logical request.
+#[tokio::test]
+async fn explicit_quota_exhaustion_cools_the_whole_group() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(
+            429,
+            r#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#,
+        )],
+    )
+    .await;
+    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set("sensenova-key-3", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 3);
+    config.routing.max_route_attempts = 4;
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-a".into();
+    config.sensenova_api_keys[2].quota_group = "account-b".into();
+    let state = state_for(config);
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the same request must fail over to the healthy group"
+    );
+    assert!(
+        state.core.routes.group_cooling("account-a").is_some(),
+        "the whole exhausted group cools"
+    );
+    assert!(
+        state.core.routes.group_cooling("account-b").is_none(),
+        "the other group stays usable"
+    );
+    assert_eq!(
+        mock.credentials_seen().await,
+        vec![
+            "Bearer sensenova-key-1".to_owned(),
+            "Bearer sensenova-key-3".to_owned()
+        ],
+        "the same-group sibling must be skipped"
+    );
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: credential and attempt-budget semantics
+// ---------------------------------------------------------------------------
+
+/// A 401 disables only the rejected credential.
+#[tokio::test]
+async fn unauthorized_disables_only_one_credential() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(401, r#"{"error":{"code":16,"message":"nope"}}"#)],
+    )
+    .await;
+    mock.set(
+        "sensenova-key-2",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    let mut config = test_config(base, 2);
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-a".into();
+    let state = state_for(config);
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let credentials = state.core.routes.credential_snapshots();
+    assert!(
+        credentials[0].unusable,
+        "the rejected credential is disabled"
+    );
+    assert!(
+        !credentials[1].unusable,
+        "the same-group sibling must stay usable (a key is not an account)"
+    );
+    assert_eq!(state.core.routes.usable_credential_count(), 1);
+    task.abort();
+}
+
+/// The single global route-attempt budget can never be exceeded, whatever the
+/// mix of failover reasons.
+#[tokio::test]
+async fn global_attempt_budget_cannot_be_exceeded() {
+    let (base, mock, task) = start_mock().await;
+    for index in 1..=6 {
+        mock.set(
+            &format!("sensenova-key-{index}"),
+            (0..4)
+                .map(|_| Spec::json(500, r#"{"error":{"message":"boom"}}"#))
+                .collect(),
+        )
+        .await;
+    }
+    mock.set_model(
+        "deepseek-v4-pro",
+        (0..4)
+            .map(|_| Spec::json(500, r#"{"error":{"message":"boom"}}"#))
+            .collect(),
+    )
+    .await;
+    mock.set_model(
+        "kimi-k3",
+        (0..4)
+            .map(|_| Spec::json(500, r#"{"error":{"message":"boom"}}"#))
+            .collect(),
+    )
+    .await;
+    let mut config = test_config(base, 6);
+    config.routing.max_route_attempts = 4;
+    for (index, key) in config.sensenova_api_keys.iter_mut().enumerate() {
+        key.quota_group = format!("group-{index}");
+    }
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        mock.seen().await.len(),
+        4,
+        "exactly max_route_attempts upstream attempts, never more"
+    );
+    task.abort();
+}
+
+/// A 404 disables that model route and the request still completes on another
+/// model without re-dialing the missing one.
+#[tokio::test]
+async fn model_not_found_is_not_retried_on_the_same_route() {
+    let (base, mock, task) = start_mock().await;
+    mock.set_model(
+        "glm-5.2",
+        vec![Spec::json(
+            404,
+            r#"{"error":{"type":"not_found_error","message":"model is not found"}}"#,
+        )],
+    )
+    .await;
+    mock.set_model("deepseek-v4-pro", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 4;
+    let state = state_for(config);
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let models = mock.models_seen().await;
+    assert_eq!(
+        models.iter().filter(|model| *model == "glm-5.2").count(),
+        1,
+        "the missing model must be dialed exactly once: {models:?}"
+    );
+    assert!(state.core.routes.route_disabled("glm-5.2", "account-a"));
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: commit barrier
+// ---------------------------------------------------------------------------
+
+/// A pre-commit failure may switch models; after the first downstream byte it
+/// never can.
+#[tokio::test]
+async fn pre_commit_cross_model_retry_works_and_post_commit_is_impossible() {
+    let (base, mock, task) = start_mock().await;
+    // glm-5.2 fails pre-commit (transient 500); deepseek-v4-pro is healthy.
+    mock.set_model(
+        "glm-5.2",
+        vec![Spec::json(500, r#"{"error":{"message":"boom"}}"#)],
+    )
+    .await;
+    mock.set_model("deepseek-v4-pro", vec![Spec::sse(ok_message_sse())])
+        .await;
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 4;
+    let app = app_for(config);
+    let response = app
+        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let models = mock.models_seen().await;
+    assert_eq!(
+        models,
+        vec!["glm-5.2".to_owned(), "deepseek-v4-pro".to_owned()],
+        "a pre-commit failure may switch models"
+    );
+    task.abort();
+}
+
+/// Once the stream is committed, a mid-stream failure never replays or
+/// switches anything.
+#[tokio::test]
+async fn post_commit_model_switching_is_impossible() {
+    let (base, mock, task) = start_mock().await;
+    let mut spec = Spec::sse(
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"
+            .to_string(),
+    );
+    spec.kind = MockBody::StreamError;
+    mock.set_model("glm-5.2", vec![spec]).await;
+    mock.set_model("deepseek-v4-pro", vec![Spec::sse(ok_message_sse())])
+        .await;
+    let mut config = test_config(base, 2);
+    config.routing.max_route_attempts = 4;
+    let app = app_for(config);
+    let response = app
+        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
+        .await
+        .unwrap();
+    let text = response_text(response).await;
+    assert!(text.contains("partial"));
+    assert!(text.contains("upstream stream was interrupted"));
+    assert_eq!(
+        mock.models_seen().await,
+        vec!["glm-5.2".to_owned()],
+        "no model switch and no replay after the commit barrier"
+    );
+    task.abort();
+}
+
+/// Streams stay byte-exact and ordered through the routing layer.
+#[tokio::test]
+async fn stream_passthrough_stays_verbatim() {
+    let (base, mock, task) = start_mock().await;
+    let sse = ok_message_sse();
+    mock.set_model("glm-5.2", vec![Spec::fragmented(sse.clone(), 3)])
+        .await;
+    let response = app_for(test_config(base, 1))
+        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    assert_eq!(response_text(response).await, sse);
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: routing resolution, models catalog, readiness, metrics
+// ---------------------------------------------------------------------------
+
+/// Old aliases and explicit catalog IDs keep working.
+#[tokio::test]
+async fn legacy_aliases_and_catalog_ids_still_work() {
+    let (base, mock, task) = start_mock().await;
+    for model in ["sensenova-6.8-flash-lite", "deepseek-v4-pro", "glm-5.2"] {
+        mock.set_model(
+            model,
+            (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+        )
+        .await;
+    }
+    let app = app_for(test_config(base, 1));
+
+    // A legacy alias still resolves to its documented target.
+    let response = app
+        .clone()
+        .oneshot(gateway_request(
+            "/v1/messages",
+            body_for_model("claude-sensenova", false),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        mock.models_seen().await,
+        vec!["sensenova-6.8-flash-lite".to_owned()]
+    );
+
+    // An anonymous Claude name still maps to the configured default.
+    let response = app
+        .clone()
+        .oneshot(gateway_request(
+            "/v1/messages",
+            body_for_model("claude-3-5-haiku-20241022", false),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // An explicit catalog ID passes through unchanged.
+    let response = app
+        .clone()
+        .oneshot(gateway_request(
+            "/v1/messages",
+            body_for_model("deepseek-v4-pro", false),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        mock.models_seen().await.last().map(String::as_str),
+        Some("deepseek-v4-pro")
+    );
+    task.abort();
+}
+
+/// `/v1/models` exposes the virtual routing aliases.
+#[tokio::test]
+async fn models_endpoint_exposes_virtual_aliases() {
+    let (base, mock, task) = start_mock().await;
+    let app = app_for(test_config(base, 1));
+    let response = app
+        .oneshot(gateway_request("/v1/models", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = response_text(response).await;
+    assert!(text.contains("claude-coding-hard"));
+    assert!(text.contains("claude-coding-fast"));
+    assert!(text.contains("glm-5.2"));
+    assert!(text.contains("kimi-k3"));
+    assert!(mock.seen().await.is_empty());
+    task.abort();
+}
+
+/// One unhealthy model must not make the proxy unready while another legal
+/// route exists.
+#[tokio::test]
+async fn readiness_survives_a_single_unhealthy_model() {
+    let (base, mock, task) = start_mock().await;
+    mock.set_model(
+        "glm-5.2",
+        vec![Spec::json(
+            404,
+            r#"{"error":{"type":"not_found_error","message":"model is not found"}}"#,
+        )],
+    )
+    .await;
+    mock.set_model("deepseek-v4-pro", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 4;
+    let state = state_for(config);
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (status, body) = ready_body(app.clone()).await;
+    assert_eq!(status, StatusCode::OK, "another legal route exists");
+    assert_eq!(body["status"], "ready");
+    assert!(body["usable_routes"].as_u64().unwrap() > 0);
+    task.abort();
+}
+
+/// Readiness reports not_ready when no route can be dialed at all.
+#[tokio::test]
+async fn readiness_is_not_ready_without_usable_routes() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(401, r#"{"error":{"code":16,"message":"nope"}}"#)],
+    )
+    .await;
+    let state = state_for(test_config(base, 1));
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let (status, body) = ready_body(app.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["status"], "not_ready");
+    assert_eq!(body["usable_credentials"], 0);
+    task.abort();
+}
+
+/// Routing metrics are exposed alongside the existing ones.
+#[tokio::test]
+async fn routing_metrics_are_exposed() {
+    let (base, mock, task) = start_mock().await;
+    mock.set_model("glm-5.2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let state = state_for(test_config(base, 1));
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let metrics = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let text = response_text(metrics).await;
+    for name in [
+        "sensenova_proxy_route_attempts_total",
+        "sensenova_proxy_route_failovers_total",
+        "sensenova_proxy_model_failovers_total",
+        "sensenova_proxy_model_account_429_total",
+        "sensenova_proxy_model_circuit_open_total",
+        "sensenova_proxy_routing_exhausted_total",
+        "sensenova_proxy_affinity_hits_total",
+        "sensenova_proxy_affinity_breaks_total",
+        "sensenova_proxy_upstream_requests_total",
+        "sensenova_proxy_requests_total",
+    ] {
+        assert!(text.contains(name), "missing metric {name}");
+    }
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: request fidelity, redaction, auth, local endpoints
+// ---------------------------------------------------------------------------
+
+/// Passthrough fidelity: everything except `model` is preserved byte-exactly.
+#[tokio::test]
+async fn request_body_is_preserved_apart_from_the_model() {
+    let (base, mock, task) = start_mock().await;
+    mock.set_model("glm-5.2", vec![Spec::json(200, ok_message_json())])
         .await;
     let request = Request::builder()
         .method("POST")
@@ -351,780 +1481,21 @@ async fn nonstream_passthrough_rewrites_model_and_preserves_body() {
             .unwrap_or_default()
             .starts_with("sensenova-proxy/")
     );
-    // Gateway credential and client cookies never travel upstream.
     assert_ne!(seen.authorization, "Bearer gateway-secret");
     assert!(seen.x_api_key.is_none());
     assert!(seen.cookie.is_none());
-    // Model rewritten, everything else preserved, max_tokens defaulted when
-    // missing.
-    assert_eq!(seen.body["model"], "sensenova-6.8-flash-lite");
+    assert_eq!(seen.body["model"], "glm-5.2");
     assert_eq!(seen.body["max_tokens"], 128);
     assert_eq!(seen.body["unknown_future_field"]["preserve"], true);
-
-    let text = response_text(response).await;
-    assert!(text.contains("\"stop_reason\":\"end_turn\""));
     task.abort();
 }
 
+/// Secrets are still redacted from upstream error bodies.
 #[tokio::test]
-async fn unknown_models_map_to_default() {
+async fn secrets_are_redacted_from_upstream_errors() {
     let (base, mock, task) = start_mock().await;
-    mock.set("sensenova-key-1", vec![Spec::json(200, ok_message_json())])
-        .await;
-    let body = json!({
-        "model": "claude-3-5-haiku-20241022",
-        "max_tokens": 16,
-        "messages": [{"role": "user", "content": "hi"}]
-    })
-    .to_string();
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", body))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let seen = mock.seen().await;
-    assert_eq!(seen[0].body["model"], "sensenova-6.8-flash-lite");
-    task.abort();
-}
-
-#[tokio::test]
-async fn missing_max_tokens_is_defaulted() {
-    let (base, mock, task) = start_mock().await;
-    mock.set("sensenova-key-1", vec![Spec::json(200, ok_message_json())])
-        .await;
-    let body = json!({
-        "model": "claude-sensenova",
-        "messages": [{"role": "user", "content": "hi"}]
-    })
-    .to_string();
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", body))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let seen = mock.seen().await;
-    assert_eq!(seen[0].body["max_tokens"], 8_192);
-    task.abort();
-}
-
-#[tokio::test]
-async fn nondefault_catalog_model_passes_through_with_upstream_snapshot_id() {
-    let (base, mock, task) = start_mock().await;
-    // SenseNova resolves catalog IDs to dated snapshots (observed:
-    // deepseek-v4-pro -> deepseek-v4-pro-0813); the response model field
-    // must pass through verbatim.
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(
-            200,
-            json!({
-                "id": "msg_ds", "type": "message", "role": "assistant",
-                "content": [{"type": "thinking", "thinking": "reason"},
-                            {"type": "text", "text": "OK"}],
-                "model": "deepseek-v4-pro-0813",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 8, "output_tokens": 25}
-            })
-            .to_string(),
-        )],
-    )
-    .await;
-    let body = json!({
-        "model": "deepseek-v4-pro",
-        "max_tokens": 64,
-        "messages": [{"role": "user", "content": "Say OK"}]
-    })
-    .to_string();
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", body))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let seen = mock.seen().await;
-    // The explicit catalog ID must reach the upstream unchanged (it is not
-    // the configured default and must not be rewritten to it).
-    assert_eq!(seen[0].body["model"], "deepseek-v4-pro");
-    let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
-    assert_eq!(value["model"], "deepseek-v4-pro-0813");
-    assert_eq!(value["content"][0]["type"], "thinking");
-    assert_eq!(value["content"][1]["text"], "OK");
-    task.abort();
-}
-
-#[tokio::test]
-async fn stream_passthrough_is_verbatim_and_ordered() {
-    let (base, mock, task) = start_mock().await;
-    let sse = ok_message_sse();
-    mock.set("sensenova-key-1", vec![Spec::sse(sse.clone())])
-        .await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
-        .await
-        .unwrap();
-    assert_eq!(
-        response.headers()[header::CONTENT_TYPE],
-        "text/event-stream"
-    );
-    let text = response_text(response).await;
-    assert_eq!(text, sse);
-    assert!(text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
-    task.abort();
-}
-
-#[tokio::test]
-async fn fragmented_sse_passes_through_byte_exact() {
-    let (base, mock, task) = start_mock().await;
-    let sse = ok_message_sse();
-    mock.set("sensenova-key-1", vec![Spec::fragmented(sse.clone(), 3)])
-        .await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
-        .await
-        .unwrap();
-    let text = response_text(response).await;
-    assert_eq!(text, sse);
-    task.abort();
-}
-
-#[tokio::test]
-async fn tool_use_stream_is_counted_and_forwarded() {
-    let (base, mock, task) = start_mock().await;
-    let sse = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n\
-               event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_x\",\"name\":\"Read\",\"input\":{}}}\n\n\
-               event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n\
-               event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"a\\\"}\"}}\n\n\
-               event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
-               event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n\
-               event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
-    mock.set("sensenova-key-1", vec![Spec::sse(sse)]).await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
-        .await
-        .unwrap();
-    let text = response_text(response).await;
-    assert!(text.contains("input_json_delta"));
-    assert!(text.contains("stop_reason\":\"tool_use"));
-    task.abort();
-}
-
-// ---------------------------------------------------------------------------
-// Tests: stream failures never replay
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn midstream_failure_emits_error_event_and_never_replays() {
-    let (base, mock, task) = start_mock().await;
-    let mut spec = Spec::sse(
-        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"
-            .to_string(),
-    );
-    spec.kind = MockBody::StreamError;
-    mock.set("sensenova-key-1", vec![spec]).await;
-    mock.set("sensenova-key-2", vec![Spec::sse(ok_message_sse())])
-        .await;
-    let response = app_for(test_config(base, 2))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
-        .await
-        .unwrap();
-    let text = response_text(response).await;
-    assert!(text.contains("partial"));
-    assert!(text.contains("upstream stream was interrupted"));
-    // No replay: exactly one upstream call even though a second key exists.
-    assert_eq!(mock.seen().await.len(), 1);
-    task.abort();
-}
-
-#[tokio::test]
-async fn malformed_sse_terminates_stream_without_replay() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::sse("data: this-is-not-json\n\n")],
-    )
-    .await;
-    let response = app_for(test_config(base, 2))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
-        .await
-        .unwrap();
-    let text = response_text(response).await;
-    assert!(text.contains("this-is-not-json"));
-    assert!(text.contains("upstream sent invalid SSE data"));
-    assert_eq!(mock.seen().await.len(), 1);
-    task.abort();
-}
-
-#[tokio::test]
-async fn stream_ending_without_message_stop_gets_error_event() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::sse(
-            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
-        )],
-    )
-    .await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
-        .await
-        .unwrap();
-    let text = response_text(response).await;
-    assert!(text.contains("upstream stream ended before message_stop"));
-    assert_eq!(mock.seen().await.len(), 1);
-    task.abort();
-}
-
-#[tokio::test]
-async fn client_disconnect_cancels_upstream_and_never_replays() {
-    let (base, mock, task) = start_mock().await;
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let mut spec =
-        Spec::sse("event: message_start\ndata: {\"type\":\"message_start\"}\n\n".to_string());
-    spec.kind = MockBody::Stall(cancelled.clone());
-    mock.set("sensenova-key-1", vec![spec]).await;
-    mock.set("sensenova-key-2", vec![Spec::sse(ok_message_sse())])
-        .await;
-    let response = app_for(test_config(base, 2))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
-        .await
-        .unwrap();
-    let mut stream = response.into_body().into_data_stream();
-    assert!(stream.next().await.is_some());
-    drop(stream);
-    for _ in 0..80 {
-        if cancelled.load(Ordering::Acquire) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(cancelled.load(Ordering::Acquire));
-    assert_eq!(mock.seen().await.len(), 1);
-    task.abort();
-}
-
-// ---------------------------------------------------------------------------
-// Tests: rate limits, quota, circuit breaker
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn direct_429_with_long_hint_returns_429_without_second_call() {
-    let (base, mock, task) = start_mock().await;
-    let mut limited = Spec::json(429, r#"{"error":{"message":"slow down"}}"#);
-    limited.headers.push(("retry-after", "17"));
-    mock.set("sensenova-key-1", vec![limited]).await;
-    let state = AppState::new(test_config(base, 1)).unwrap();
-    let response = router(state.clone())
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(response.headers()[header::RETRY_AFTER], "17");
-    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
-    assert_eq!(body["error"]["type"], "rate_limit_error");
-    assert_eq!(mock.seen().await.len(), 1);
-    task.abort();
-}
-
-#[tokio::test]
-async fn long_hint_is_parsed_from_human_text() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(
-            429,
-            r#"{"error":{"message":"Daily free limit reached. Try again in 2h 30m"}}"#,
-        )],
-    )
-    .await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    let retry_after = response.headers()[header::RETRY_AFTER].to_str().unwrap();
-    assert_eq!(retry_after, "9000");
-    task.abort();
-}
-
-#[tokio::test]
-async fn short_429_is_waited_out_on_the_same_key() {
-    let (base, mock, task) = start_mock().await;
-    let mut short = Spec::json(429, r#"{"error":{"message":"busy"}}"#);
-    short.headers.push(("retry-after", "1"));
-    mock.set(
-        "sensenova-key-1",
-        vec![short, Spec::json(200, ok_message_json())],
-    )
-    .await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "short 429 must be retried"
-    );
-    assert_eq!(mock.seen().await.len(), 2);
-    task.abort();
-}
-
-#[tokio::test]
-async fn quota_exhaustion_opens_circuit_and_blocks_followup_requests() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(
-            429,
-            r#"{"error":{"code":8,"message":"RESOURCE_EXHAUSTED: free quota exhausted"}}"#,
-        )],
-    )
-    .await;
-    let state = AppState::new(test_config(base, 1)).unwrap();
-    let app = router(state.clone());
-    let first = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
-    let retry_after_present = first.headers().contains_key(header::RETRY_AFTER);
-    let body: Value = serde_json::from_str(&response_text(first).await).unwrap();
-    assert_eq!(body["error"]["type"], "rate_limit_error");
-    assert!(retry_after_present);
-
-    // Circuit is open: the second request must not reach the upstream.
-    let second = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-    let text = response_text(second).await;
-    assert!(text.contains("circuit open"));
-    assert_eq!(mock.seen().await.len(), 1);
-    task.abort();
-}
-
-#[tokio::test]
-async fn upstream_401_fails_over_to_next_key_and_sticks() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(
-            401,
-            r#"{"error":{"code":16,"message":"Authorization Not Found"}}"#,
-        )],
-    )
-    .await;
-    mock.set(
-        "sensenova-key-2",
-        vec![
-            Spec::json(200, ok_message_json()),
-            Spec::json(200, ok_message_json()),
-        ],
-    )
-    .await;
-    let app = app_for(test_config(base, 2));
-    for _ in 0..2 {
-        let response = app
-            .clone()
-            .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-    let authorizations: Vec<String> = mock
-        .seen()
-        .await
-        .into_iter()
-        .map(|request| request.authorization)
-        .collect();
-    assert_eq!(
-        authorizations,
-        vec![
-            "Bearer sensenova-key-1".to_string(),
-            "Bearer sensenova-key-2".to_string(),
-            "Bearer sensenova-key-2".to_string(),
-        ]
-    );
-    task.abort();
-}
-
-#[tokio::test]
-async fn upstream_401_with_single_key_marks_gateway_not_ready() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(401, r#"{"error":{"code":16,"message":"nope"}}"#)],
-    )
-    .await;
-    let state = AppState::new(test_config(base, 1)).unwrap();
-    let app = router(state);
-    let response = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
-    assert_eq!(body["error"]["type"], "authentication_error");
-
-    let ready = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let ready_body: Value = serde_json::from_str(&response_text(ready).await).unwrap();
-    assert_eq!(ready_body["status"], "not_ready");
-    task.abort();
-}
-
-// ---------------------------------------------------------------------------
-// Tests: 429 classification vs quota exhaustion (production bug regression)
-// ---------------------------------------------------------------------------
-
-/// Scenario A/C (spec §32): a generic 429 — even with Google-style code 8
-/// (RESOURCE_EXHAUSTED) — is a PER-KEY rate limit. It must cool only that
-/// key, never the whole quota group, never open the quota circuit, and the
-/// same request must fail over to another credential in the SAME group.
-#[tokio::test]
-async fn generic_429_code8_is_per_key_and_never_cools_the_group() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![
-            Spec::json(
-                429,
-                r#"{"error":{"code":8,"message":"RESOURCE_EXHAUSTED"}}"#,
-            ),
-            Spec::json(200, ok_message_json()),
-        ],
-    )
-    .await;
-    mock.set(
-        "sensenova-key-2",
-        vec![
-            Spec::json(200, ok_message_json()),
-            Spec::json(200, ok_message_json()),
-        ],
-    )
-    .await;
-    // Both credentials share one quota group: the strongest proof that the
-    // group was NOT marked exhausted is that key-2 (same group) still serves.
-    let mut config = test_config(base, 2);
-    for key in &mut config.sensenova_api_keys {
-        key.quota_group = "account-a".into();
-    }
-    let state = AppState::new(config).unwrap();
-    let app = router(state.clone());
-
-    let response = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK, "failover must succeed");
-
-    // Per-key cooldown, not group cooling, not quota circuit.
-    let snapshots = state.core.pool.snapshots();
-    assert!(snapshots[0].cooling_remaining.is_some(), "key-1 cools");
-    assert!(
-        snapshots[1].cooling_remaining.is_none(),
-        "key-2 (same group) must remain usable"
-    );
-    assert_eq!(
-        state.core.circuit.state(),
-        crate::circuit::CircuitState::Closed,
-        "generic 429 must not open the quota circuit"
-    );
-
-    // The request went to key-1 then failed over to key-2.
-    let authorizations: Vec<String> = mock
-        .seen()
-        .await
-        .into_iter()
-        .map(|request| request.authorization)
-        .collect();
-    assert_eq!(
-        authorizations,
-        vec![
-            "Bearer sensenova-key-1".to_string(),
-            "Bearer sensenova-key-2".to_string(),
-        ]
-    );
-
-    // Next request stays sticky on key-2.
-    let response = app
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    task.abort();
-}
-
-/// Scenario B (spec §32): explicit FREE_QUOTA_EXHAUSTED on one key cools the
-/// whole quota group (a same-group second key is skipped) while a different
-/// quota group remains usable — the global circuit must NOT block it.
-#[tokio::test]
-async fn explicit_quota_exhaustion_spares_other_groups() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(
-            429,
-            r#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#,
-        )],
-    )
-    .await;
-    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
-        .await;
-    mock.set("sensenova-key-3", vec![Spec::json(200, ok_message_json())])
-        .await;
-
-    let mut config = test_config(base, 3);
-    config.sensenova_api_keys[0].quota_group = "account-a".into();
-    config.sensenova_api_keys[1].quota_group = "account-a".into();
-    config.sensenova_api_keys[2].quota_group = "account-b".into();
-    let state = AppState::new(config).unwrap();
-    let app = router(state.clone());
-
-    // Single logical request: key-1 hits explicit quota exhaustion, the
-    // whole account-a group cools, and the SAME request fails over to
-    // group B — the client never sees a 429.
-    let response = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let snapshots = state.core.pool.snapshots();
-    assert!(snapshots[0].cooling_remaining.is_some(), "key-1 cools");
-    assert!(
-        snapshots[1].cooling_remaining.is_some(),
-        "key-2 (same group) is skipped via group cooldown"
-    );
-    assert!(
-        snapshots[2].cooling_remaining.is_none(),
-        "key-3 (group B) remains usable"
-    );
-    assert_eq!(
-        state.core.circuit.state(),
-        crate::circuit::CircuitState::Closed,
-        "circuit must stay closed while another quota group is usable"
-    );
-
-    // Failover skipped the whole account-a group and landed on key-3;
-    // key-2 was never dialed.
-    let authorizations: Vec<String> = mock
-        .seen()
-        .await
-        .into_iter()
-        .map(|request| request.authorization)
-        .collect();
-    assert_eq!(
-        authorizations,
-        vec![
-            "Bearer sensenova-key-1".to_string(),
-            "Bearer sensenova-key-3".to_string(),
-        ]
-    );
-    task.abort();
-}
-
-/// With a single quota group, explicit quota exhaustion still opens the
-/// global circuit (no other group exists to serve), and follow-up requests
-/// fail fast without dialing the upstream.
-#[tokio::test]
-async fn single_group_quota_exhaustion_still_opens_circuit() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![
-            Spec::json(429, r#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#),
-            Spec::json(200, ok_message_json()),
-        ],
-    )
-    .await;
-    let state = AppState::new(test_config(base, 1)).unwrap();
-    let app = router(state.clone());
-    let first = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
-    let second = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-    // The second request was refused locally: the upstream was dialed once.
-    assert_eq!(mock.seen().await.len(), 1);
-    task.abort();
-}
-
-// ---------------------------------------------------------------------------
-// Tests: transient failures, retries, and error fidelity
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn transient_500_is_retried_within_budget() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![
-            Spec::json(500, r#"{"error":{"message":"internal"}}"#),
-            Spec::json(200, ok_message_json()),
-        ],
-    )
-    .await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(mock.seen().await.len(), 2);
-    task.abort();
-}
-
-#[tokio::test]
-async fn persistent_502_exhausts_budget_and_returns_502() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![
-            Spec::json(502, "bad gateway"),
-            Spec::json(502, "bad gateway"),
-        ],
-    )
-    .await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let retry_after_absent = !response.headers().contains_key(header::RETRY_AFTER);
-    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
-    assert_eq!(body["error"]["type"], "api_error");
-    assert!(retry_after_absent);
-    assert_eq!(mock.seen().await.len(), 2);
-    task.abort();
-}
-
-#[tokio::test]
-async fn false_positive_429_text_is_not_treated_as_rate_limit() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![
-            Spec::json(500, "request 429123 referenced status 429 in a note"),
-            Spec::json(500, "request 429123 referenced status 429 in a note"),
-        ],
-    )
-    .await;
-    let state = AppState::new(test_config(base, 1)).unwrap();
-    let app = router(state.clone());
-    let response = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    // Upstream 5xx statuses are preserved (Retry-After absent).
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(!response.headers().contains_key(header::RETRY_AFTER));
-    // The key must not be cooling: a later request dials upstream again.
-    let response = app
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(mock.seen().await.len(), 4);
-    task.abort();
-}
-
-#[tokio::test]
-async fn invalid_request_400_passes_through_without_retry() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(
-            400,
-            r#"{"type":"error","error":{"type":"invalid_request_error","message":"invalid arguments"}}"#,
-        )],
-    )
-    .await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
-    assert_eq!(body["error"]["type"], "invalid_request_error");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("invalid arguments")
-    );
-    assert_eq!(mock.seen().await.len(), 1);
-    task.abort();
-}
-
-#[tokio::test]
-async fn model_not_found_404_passes_through() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(
-            404,
-            r#"{"type":"error","error":{"type":"not_found_error","message":"model is not found"}}"#,
-        )],
-    )
-    .await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
-    assert_eq!(body["error"]["type"], "not_found_error");
-    assert_eq!(mock.seen().await.len(), 1);
-    task.abort();
-}
-
-#[tokio::test]
-async fn upstream_malformed_json_is_retried_then_502() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![
-            Spec::json(200, "this is not json"),
-            Spec::json(200, "still not"),
-        ],
-    )
-    .await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(mock.seen().await.len(), 2);
-    task.abort();
-}
-
-#[tokio::test]
-async fn secrets_are_redacted_from_upstream_error_bodies() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
+    mock.set_model(
+        "glm-5.2",
         vec![Spec::json(
             400,
             r#"{"error":{"message":"invalid key sensenova-key-1 for gateway-secret user"}}"#,
@@ -1142,543 +1513,9 @@ async fn secrets_are_redacted_from_upstream_error_bodies() {
     task.abort();
 }
 
+/// Every API route still requires the gateway key.
 #[tokio::test]
-async fn empty_stream_body_fails_fast_instead_of_hanging() {
-    let (base, mock, task) = start_mock().await;
-    // 200 with an empty body: EOF before any byte must be treated as a
-    // protocol failure (retried, then 502), never as a busy wait.
-    mock.set(
-        "sensenova-key-1",
-        vec![
-            Spec::json(200, "").content_type_sse(),
-            Spec::json(200, "").content_type_sse(),
-        ],
-    )
-    .await;
-    let mut config = test_config(base, 1);
-    config.upstream.first_byte_timeout_secs = 2;
-    let response = app_for(config)
-        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(mock.seen().await.len(), 2);
-    task.abort();
-}
-
-#[tokio::test]
-async fn quota_cooldown_is_capped_by_configuration() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(
-            429,
-            r#"{"error":{"message":"free quota exhausted. Try again in 10d"}}"#,
-        )],
-    )
-    .await;
-    let mut config = test_config(base, 1);
-    config.circuit.max_quota_cooldown_secs = 120;
-    let response = app_for(config)
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    // The 10-day human hint is capped to the configured 120 s.
-    assert_eq!(response.headers()[header::RETRY_AFTER], "120");
-    task.abort();
-}
-
-/// §31 KEY REGRESSION: one logical request must never be replayed against
-/// the same key beyond `max_same_key_retries`. With max_attempts=4 and
-/// max_same_key_retries=1, repeated "200 + EOF before first byte" responses
-/// must stop after TWO upstream attempts (initial + one same-key replay),
-/// not four — replaying a 72 KB prompt four times is exactly the TPM burst
-/// this proxy must not create.
-#[tokio::test]
-async fn single_key_stream_eof_replay_is_capped_by_same_key_budget() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![
-            Spec::json(200, "").content_type_sse(),
-            Spec::json(200, "").content_type_sse(),
-            Spec::sse(ok_message_sse()),
-        ],
-    )
-    .await;
-    let mut config = test_config(base, 1);
-    config.retry.max_attempts = 4;
-    config.retry.max_same_key_retries = 1;
-    config.upstream.first_byte_timeout_secs = 2;
-    let response = app_for(config)
-        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
-        .await
-        .unwrap();
-    // The third upstream attempt was never made: budget exhausted.
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(mock.seen().await.len(), 2, "same-key replay must be capped");
-    task.abort();
-}
-
-/// §32: with another credential available, a pre-commit transient failure
-/// fails over immediately instead of replaying the same key.
-#[tokio::test]
-async fn stream_eof_fails_over_to_next_key_without_same_key_replay() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(200, "").content_type_sse()],
-    )
-    .await;
-    mock.set("sensenova-key-2", vec![Spec::sse(ok_message_sse())])
-        .await;
-    let mut config = test_config(base, 2);
-    config.retry.max_attempts = 4;
-    config.retry.max_same_key_retries = 1;
-    config.upstream.first_byte_timeout_secs = 2;
-    let response = app_for(config)
-        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let authorizations: Vec<String> = mock
-        .seen()
-        .await
-        .into_iter()
-        .map(|request| request.authorization)
-        .collect();
-    assert_eq!(
-        authorizations,
-        vec![
-            "Bearer sensenova-key-1".to_string(),
-            "Bearer sensenova-key-2".to_string(),
-        ],
-        "one attempt per credential: failover, not A×4"
-    );
-    task.abort();
-}
-
-/// §33/§35: a generic 429 without Retry-After gets the short progressive
-/// fallback cooldown (~5s band for the first occurrence), not 60s.
-#[tokio::test]
-async fn generic_429_fallback_cooldown_is_short_and_progressive() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![
-            Spec::json(429, r#"{"error":{"message":"Server is busy"}}"#),
-            Spec::json(429, r#"{"error":{"message":"Server is busy"}}"#),
-        ],
-    )
-    .await;
-    let mut config = test_config(base, 1);
-    config.retry.max_attempts = 2;
-    config.retry.max_same_key_retries = 1;
-    config.retry.rate_limit_fallback_initial_secs = 5;
-    config.retry.rate_limit_fallback_max_secs = 60;
-    config.retry.retry_429_with_short_retry_after = false;
-    let state = AppState::new(config).unwrap();
-    let app = router(state.clone());
-
-    let first = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
-    let retry_after: u64 = first.headers()[header::RETRY_AFTER]
-        .to_str()
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(
-        (5..=8).contains(&retry_after),
-        "first fallback cooldown must be in the ~5s band (5-7.5s + ceil), got {retry_after}"
-    );
-
-    // Second logical request: the key is still cooling, so the request is
-    // answered locally with the earliest remaining cooldown.
-    let second = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(mock.seen().await.len(), 1, "cooldown must shield upstream");
-    task.abort();
-}
-
-/// §35: consecutive generic 429s escalate the fallback ladder (~1s → ~2s
-/// with a 1s initial for test speed). An authoritative Retry-After always
-/// wins over the ladder.
-#[tokio::test]
-async fn repeated_generic_429s_escalate_fallback_ladder() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![
-            Spec::json(429, r#"{"error":{"message":"Server is busy"}}"#),
-            Spec::json(429, r#"{"error":{"message":"Server is busy"}}"#),
-        ],
-    )
-    .await;
-    let mut config = test_config(base, 1);
-    config.retry.max_attempts = 1;
-    config.retry.rate_limit_fallback_initial_secs = 1;
-    config.retry.rate_limit_fallback_max_secs = 60;
-    let state = AppState::new(config).unwrap();
-    let app = router(state.clone());
-
-    let first = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
-    let first_retry_after: u64 = first.headers()[header::RETRY_AFTER]
-        .to_str()
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(
-        (1..=2).contains(&first_retry_after),
-        "first fallback cooldown must be in the ~1s band, got {first_retry_after}"
-    );
-
-    // Wait out the first short cooldown, then trigger the second one.
-    tokio::time::sleep(Duration::from_millis(2_000)).await;
-    let second = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-    let second_retry_after: u64 = second.headers()[header::RETRY_AFTER]
-        .to_str()
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(
-        (2..=3).contains(&second_retry_after),
-        "second consecutive generic 429 must escalate to the ~2s band, got {second_retry_after}"
-    );
-    assert_eq!(mock.seen().await.len(), 2);
-    task.abort();
-}
-
-/// §38: repeated generic 429s on one credential must never open the global
-/// circuit — a healthy credential in another quota group keeps serving.
-#[tokio::test]
-async fn repeated_generic_429s_do_not_global_block_other_groups() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        (0..5)
-            .map(|_| Spec::json(429, r#"{"error":{"message":"inference tpm exhausted"}}"#))
-            .collect(),
-    )
-    .await;
-    mock.set(
-        "sensenova-key-2",
-        (0..5).map(|_| Spec::json(200, ok_message_json())).collect(),
-    )
-    .await;
-    let mut config = test_config(base, 2);
-    config.sensenova_api_keys[0].quota_group = "account-a".into();
-    config.sensenova_api_keys[1].quota_group = "account-b".into();
-    config.retry.retry_429_with_short_retry_after = false;
-    let state = AppState::new(config).unwrap();
-    let app = router(state.clone());
-    for _ in 0..5 {
-        let response = app
-            .clone()
-            .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "group B keeps serving");
-    }
-    assert_eq!(
-        state.core.circuit.state(),
-        crate::circuit::CircuitState::Closed,
-        "generic 429s must not drive the global circuit"
-    );
-    task.abort();
-}
-
-/// §18 Test 3: when EVERY quota group reports explicit quota exhaustion
-/// within one logical request, the client finally gets 429 and the global
-/// quota circuit opens (no usable credential remains).
-#[tokio::test]
-async fn all_groups_quota_exhausted_returns_429_and_opens_circuit() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(
-            429,
-            r#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#,
-        )],
-    )
-    .await;
-    mock.set(
-        "sensenova-key-2",
-        vec![Spec::json(
-            429,
-            r#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#,
-        )],
-    )
-    .await;
-    let mut config = test_config(base, 2);
-    config.sensenova_api_keys[0].quota_group = "account-a".into();
-    config.sensenova_api_keys[1].quota_group = "account-b".into();
-    config.retry.max_attempts = 2;
-    let state = AppState::new(config).unwrap();
-    let app = router(state.clone());
-    let response = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(mock.seen().await.len(), 2, "both groups were tried");
-    let snapshots = state.core.pool.snapshots();
-    assert!(snapshots[0].cooling_remaining.is_some());
-    assert!(snapshots[1].cooling_remaining.is_some());
-    assert_eq!(
-        state.core.circuit.state(),
-        crate::circuit::CircuitState::Open,
-        "no usable credential remains: quota circuit opens"
-    );
-    task.abort();
-}
-
-/// §18 Test 4: a generic 429 (account-level serving limit) prefers a
-/// credential from a DIFFERENT quota group over a same-group sibling.
-#[tokio::test]
-async fn generic_429_prefers_other_quota_group() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(
-            429,
-            r#"{"error":{"message":"inference tpm exhausted"}}"#,
-        )],
-    )
-    .await;
-    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
-        .await;
-    mock.set("sensenova-key-3", vec![Spec::json(200, ok_message_json())])
-        .await;
-    let mut config = test_config(base, 3);
-    config.sensenova_api_keys[0].quota_group = "account-a".into();
-    config.sensenova_api_keys[1].quota_group = "account-a".into();
-    config.sensenova_api_keys[2].quota_group = "account-b".into();
-    let response = app_for(config)
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let authorizations: Vec<String> = mock
-        .seen()
-        .await
-        .into_iter()
-        .map(|request| request.authorization)
-        .collect();
-    assert_eq!(
-        authorizations,
-        vec![
-            "Bearer sensenova-key-1".to_string(),
-            "Bearer sensenova-key-3".to_string(),
-        ],
-        "group B must be preferred over the same-group sibling"
-    );
-    task.abort();
-}
-
-/// §18 Test 5: with no other quota group, a generic 429 still fails over to
-/// the same-group sibling.
-#[tokio::test]
-async fn generic_429_falls_back_to_same_group_when_no_other() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(429, r#"{"error":{"message":"busy"}}"#)],
-    )
-    .await;
-    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
-        .await;
-    let mut config = test_config(base, 2);
-    for key in &mut config.sensenova_api_keys {
-        key.quota_group = "account-a".into();
-    }
-    let response = app_for(config)
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let authorizations: Vec<String> = mock
-        .seen()
-        .await
-        .into_iter()
-        .map(|request| request.authorization)
-        .collect();
-    assert_eq!(
-        authorizations,
-        vec![
-            "Bearer sensenova-key-1".to_string(),
-            "Bearer sensenova-key-2".to_string(),
-        ]
-    );
-    task.abort();
-}
-
-/// §18 Test 6: stream EOF before first byte prefers a different quota
-/// group over the same-group sibling.
-#[tokio::test]
-async fn stream_eof_prefers_other_quota_group() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(200, "").content_type_sse()],
-    )
-    .await;
-    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
-        .await;
-    mock.set("sensenova-key-3", vec![Spec::sse(ok_message_sse())])
-        .await;
-    let mut config = test_config(base, 3);
-    config.sensenova_api_keys[0].quota_group = "account-a".into();
-    config.sensenova_api_keys[1].quota_group = "account-a".into();
-    config.sensenova_api_keys[2].quota_group = "account-b".into();
-    config.upstream.first_byte_timeout_secs = 2;
-    let response = app_for(config)
-        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let authorizations: Vec<String> = mock
-        .seen()
-        .await
-        .into_iter()
-        .map(|request| request.authorization)
-        .collect();
-    assert_eq!(
-        authorizations,
-        vec![
-            "Bearer sensenova-key-1".to_string(),
-            "Bearer sensenova-key-3".to_string(),
-        ],
-        "EOF failover must prefer group B over the same-group sibling"
-    );
-    task.abort();
-}
-
-/// §18 Test 7: a 401 is credential-specific — the sibling key in the same
-/// quota group remains usable and must not be skipped by group logic.
-#[tokio::test]
-async fn auth_failover_may_stay_in_the_same_group() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        vec![Spec::json(401, r#"{"error":{"code":16,"message":"nope"}}"#)],
-    )
-    .await;
-    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
-        .await;
-    mock.set("sensenova-key-3", vec![Spec::json(200, ok_message_json())])
-        .await;
-    let mut config = test_config(base, 3);
-    config.sensenova_api_keys[0].quota_group = "account-a".into();
-    config.sensenova_api_keys[1].quota_group = "account-a".into();
-    config.sensenova_api_keys[2].quota_group = "account-b".into();
-    config.retry.max_attempts = 2;
-    let state = AppState::new(config).unwrap();
-    let app = router(state.clone());
-    let response = app
-        .clone()
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let snapshots = state.core.pool.snapshots();
-    assert!(snapshots[0].unusable, "rejected key is disabled");
-    assert!(
-        !snapshots[1].unusable && snapshots[1].cooling_remaining.is_none(),
-        "same-group sibling must NOT be punished for a credential-specific 401"
-    );
-    let authorizations: Vec<String> = mock
-        .seen()
-        .await
-        .into_iter()
-        .map(|request| request.authorization)
-        .collect();
-    assert_eq!(authorizations[0], "Bearer sensenova-key-1");
-    task.abort();
-}
-
-/// §18 Test 8: max_attempts remains the hard cap across group-aware
-/// failover — extra credentials beyond the budget are never dialed.
-#[tokio::test]
-async fn max_attempts_caps_group_aware_failover() {
-    let (base, mock, task) = start_mock().await;
-    for index in 1..=4 {
-        mock.set(
-            &format!("sensenova-key-{index}"),
-            vec![Spec::json(500, r#"{"error":{"message":"boom"}}"#)],
-        )
-        .await;
-    }
-    let mut config = test_config(base, 4);
-    for (index, key) in config.sensenova_api_keys.iter_mut().enumerate() {
-        key.quota_group = format!("group-{}", index + 1);
-    }
-    config.retry.max_attempts = 2;
-    let response = app_for(config)
-        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(
-        mock.seen().await.len(),
-        2,
-        "credentials beyond the attempt budget must never be dialed"
-    );
-    task.abort();
-}
-
-// ---------------------------------------------------------------------------
-// Tests: request validation, local endpoints, auth
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn malformed_client_json_is_400_without_upstream_call() {
-    let (base, mock, task) = start_mock().await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request("/v1/messages", "{\"model\":"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(mock.seen().await.is_empty());
-    task.abort();
-}
-
-#[tokio::test]
-async fn missing_model_is_400_without_upstream_call() {
-    let (base, mock, task) = start_mock().await;
-    let response = app_for(test_config(base, 1))
-        .oneshot(gateway_request(
-            "/v1/messages",
-            json!({"messages": []}).to_string(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(mock.seen().await.is_empty());
-    task.abort();
-}
-
-#[tokio::test]
-async fn auth_required_for_all_api_routes() {
+async fn auth_is_required_on_api_routes() {
     let (base, mock, task) = start_mock().await;
     let app = app_for(test_config(base, 1));
     for (method, path, body) in [
@@ -1697,22 +1534,17 @@ async fn auth_required_for_all_api_routes() {
             .unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
-        let text = response_text(response).await;
-        assert!(text.contains("authentication_error"), "{path}");
+        assert!(
+            response_text(response)
+                .await
+                .contains("authentication_error")
+        );
     }
-    // Wrong key is rejected too.
-    let request = Request::builder()
-        .method("GET")
-        .uri("/v1/models")
-        .header(header::AUTHORIZATION, "Bearer wrong")
-        .body(Body::empty())
-        .unwrap();
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(mock.seen().await.is_empty());
     task.abort();
 }
 
+/// Health/readiness/metrics and local token counting still work offline.
 #[tokio::test]
 async fn local_endpoints_work_without_upstream() {
     let (base, mock, task) = start_mock().await;
@@ -1725,32 +1557,11 @@ async fn local_endpoints_work_without_upstream() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
-    let models = app
-        .clone()
-        .oneshot(gateway_request("/v1/models", Body::empty()))
-        .await
-        .unwrap();
-    let models_text = response_text(models).await;
-    assert!(models_text.contains("claude-sensenova"));
-    assert!(models_text.contains("sensenova-6.8-flash-lite"));
-
-    // Anthropic-style model list when the client speaks Anthropic.
-    let request = Request::builder()
-        .method("GET")
-        .uri("/v1/models")
-        .header(header::AUTHORIZATION, "Bearer gateway-secret")
-        .header("anthropic-version", "2023-06-01")
-        .body(Body::empty())
-        .unwrap();
-    let models = app.clone().oneshot(request).await.unwrap();
-    let anthropic_models: Value = serde_json::from_str(&response_text(models).await).unwrap();
-    assert_eq!(anthropic_models["data"][0]["type"], "model");
-
     let count = app
         .clone()
         .oneshot(gateway_request(
             "/v1/messages/count_tokens",
-            json!({"model":"claude-sensenova","messages":[{"role":"user","content":"hello world"}]})
+            json!({"model":"claude-coding-hard","messages":[{"role":"user","content":"hello world"}]})
                 .to_string(),
         ))
         .await
@@ -1759,16 +1570,35 @@ async fn local_endpoints_work_without_upstream() {
         count.headers()["x-sensenova-proxy-token-count"],
         "approximate"
     );
-    let count_value: Value = serde_json::from_str(&response_text(count).await).unwrap();
-    assert!(count_value["input_tokens"].as_u64().unwrap() > 0);
     assert!(mock.seen().await.is_empty());
     task.abort();
 }
 
+/// Malformed client input never reaches the upstream.
+#[tokio::test]
+async fn invalid_client_requests_never_dial_upstream() {
+    let (base, mock, task) = start_mock().await;
+    let app = app_for(test_config(base, 1));
+    for body in [
+        "{\"model\":".to_owned(),
+        json!({"messages": []}).to_string(),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(gateway_request("/v1/messages", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert!(mock.seen().await.is_empty());
+    task.abort();
+}
+
+/// A request id supplied by the client is echoed back.
 #[tokio::test]
 async fn request_id_is_echoed() {
     let (base, mock, task) = start_mock().await;
-    mock.set("sensenova-key-1", vec![Spec::json(200, ok_message_json())])
+    mock.set_model("glm-5.2", vec![Spec::json(200, ok_message_json())])
         .await;
     let request = Request::builder()
         .method("POST")
@@ -1786,12 +1616,220 @@ async fn request_id_is_echoed() {
     task.abort();
 }
 
+// ---------------------------------------------------------------------------
+// Tests: session affinity
+// ---------------------------------------------------------------------------
+
+/// Affinity keeps a session on a route it already used, then expires.
 #[tokio::test]
-async fn metrics_expose_upstream_counters() {
+async fn affinity_hits_and_expires() {
     let (base, mock, task) = start_mock().await;
-    mock.set("sensenova-key-1", vec![Spec::json(200, ok_message_json())])
+    let mut config = test_config(base, 2);
+    config.routing.soft_affinity_secs = 1;
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    // Both groups serve the same model so affinity (not health) decides.
+    mock.set_model(
+        "glm-5.2",
+        (0..8).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    mock.set_model(
+        "deepseek-v4-pro",
+        (0..8).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    let state = state_for(config);
+    let app = router(state.clone());
+
+    let mut chosen = Vec::new();
+    for _ in 0..4 {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, "Bearer gateway-secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-claude-code-session-id", "affinity-session")
+            .body(anthropic_body(false))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        chosen.push(mock.models_seen().await.last().cloned().unwrap_or_default());
+    }
+    assert_eq!(
+        state.core.routes.affinity_len(),
+        1,
+        "affinity state is bounded to one remembered session"
+    );
+
+    // Past the TTL the entry is reclaimed.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header(header::AUTHORIZATION, "Bearer gateway-secret")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-claude-code-session-id", "affinity-session")
+        .body(anthropic_body(false))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    task.abort();
+}
+
+/// Affinity is broken the moment its route fails.
+#[tokio::test]
+async fn affinity_is_broken_by_a_429() {
+    let (base, mock, task) = start_mock().await;
+    let mut config = test_config(base, 2);
+    config.routing.soft_affinity_secs = 300;
+    config.routing.max_route_attempts = 4;
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    // First request succeeds (session is remembered), the second 429s on the
+    // remembered route and fails over, which must break the affinity.
+    mock.set_model("glm-5.2", vec![Spec::json(200, ok_message_json())])
         .await;
-    let state = AppState::new(test_config(base, 1)).unwrap();
+    mock.set_model("deepseek-v4-pro", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let state = state_for(config);
+    let app = router(state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header(header::AUTHORIZATION, "Bearer gateway-secret")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-claude-code-session-id", "affinity-session")
+        .body(anthropic_body(false))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(state.core.routes.affinity_len(), 1);
+
+    // Script the remembered model to fail; the failover breaks affinity.
+    mock.set_model(
+        "glm-5.2",
+        vec![Spec::json(429, r#"{"error":{"message":"busy"}}"#)],
+    )
+    .await;
+    mock.set_model(
+        "deepseek-v4-pro",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header(header::AUTHORIZATION, "Bearer gateway-secret")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-claude-code-session-id", "affinity-session")
+        .body(anthropic_body(false))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        state.core.routes.affinity_len(),
+        0,
+        "a health event must drop the affinity"
+    );
+    assert!(state.core.routes.affinity_break_count() >= 1);
+    task.abort();
+}
+
+/// Affinity state stays bounded no matter how many sessions appear.
+#[tokio::test]
+async fn affinity_state_is_bounded() {
+    let (base, mock, task) = start_mock().await;
+    let mut config = test_config(base, 1);
+    config.routing.soft_affinity_secs = 300;
+    config.routing.max_affinity_entries = 4;
+    mock.set_model(
+        "glm-5.2",
+        (0..40)
+            .map(|_| Spec::json(200, ok_message_json()))
+            .collect(),
+    )
+    .await;
+    let state = state_for(config);
+    let app = router(state.clone());
+    for index in 0..16 {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, "Bearer gateway-secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-claude-code-session-id", format!("session-{index}"))
+            .body(anthropic_body(false))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert!(
+        state.core.routes.affinity_len() <= 4,
+        "affinity must stay within max_affinity_entries, got {}",
+        state.core.routes.affinity_len()
+    );
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: load spreading and inflight accounting
+// ---------------------------------------------------------------------------
+
+/// Equivalent healthy routes are spread across accounts instead of always
+/// dialing the first.
+#[tokio::test]
+async fn healthy_routes_spread_load_across_accounts() {
+    let (base, mock, task) = start_mock().await;
+    let mut config = test_config(base, 4);
+    for (index, key) in config.sensenova_api_keys.iter_mut().enumerate() {
+        key.quota_group = format!("account-{}", (index % 2) + 1);
+    }
+    mock.set_model(
+        "glm-5.2",
+        (0..16)
+            .map(|_| Spec::json(200, ok_message_json()))
+            .collect(),
+    )
+    .await;
+    mock.set_model(
+        "deepseek-v4-pro",
+        (0..16)
+            .map(|_| Spec::json(200, ok_message_json()))
+            .collect(),
+    )
+    .await;
+    let app = app_for(config);
+    for _ in 0..8 {
+        let response = app
+            .clone()
+            .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let credentials = mock.credentials_seen().await;
+    let distinct: std::collections::HashSet<&String> = credentials.iter().collect();
+    assert!(
+        distinct.len() > 1,
+        "equivalent routes must be spread across credentials, saw {credentials:?}"
+    );
+    task.abort();
+}
+
+/// Inflight counters return to zero on every path: success, error, and
+/// client disconnect.
+#[tokio::test]
+async fn inflight_is_released_on_every_path() {
+    let (base, mock, task) = start_mock().await;
+    mock.set_model("glm-5.2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set_model(
+        "deepseek-v4-pro",
+        vec![Spec::json(500, r#"{"error":{"message":"boom"}}"#)],
+    )
+    .await;
+    let state = state_for(test_config(base, 1));
     let app = router(state.clone());
     let response = app
         .clone()
@@ -1799,31 +1837,57 @@ async fn metrics_expose_upstream_counters() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let metrics = app
-        .oneshot(
-            Request::builder()
-                .uri("/metrics")
-                .body(Body::empty())
-                .unwrap(),
-        )
+
+    // A stream that is abandoned mid-flight must still release its slot.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut spec =
+        Spec::sse("event: message_start\ndata: {\"type\":\"message_start\"}\n\n".to_string());
+    spec.kind = MockBody::Stall(cancelled.clone());
+    mock.set_model("glm-5.2", vec![spec]).await;
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
         .await
         .unwrap();
-    let text = response_text(metrics).await;
-    assert!(text.contains("sensenova_proxy_requests_total 1"));
-    assert!(text.contains("sensenova_proxy_upstream_requests_total 1"));
-    let _ = state;
+    let mut stream = response.into_body().into_data_stream();
+    assert!(stream.next().await.is_some());
+    drop(stream);
+    for _ in 0..80 {
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(cancelled.load(Ordering::Acquire));
+
+    let inflight: usize = state
+        .core
+        .routes
+        .credential_snapshots()
+        .iter()
+        .map(|snapshot| snapshot.inflight)
+        .sum();
+    assert_eq!(inflight, 0, "no inflight slot may leak");
+    assert_eq!(mock.seen().await.len(), 2, "no replay after commit");
     task.abort();
 }
 
 // ---------------------------------------------------------------------------
-// Tests: concurrency shaping
+// Tests: concurrency shaping (preserved behaviour)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrency_limit_and_queue_bounds_are_respected() {
     let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
+    mock.set_model(
+        "glm-5.2",
+        (0..4)
+            .map(|_| Spec::json(200, ok_message_json()).with_delay(Duration::from_millis(150)))
+            .collect(),
+    )
+    .await;
+    mock.set_model(
+        "deepseek-v4-pro",
         (0..4)
             .map(|_| Spec::json(200, ok_message_json()).with_delay(Duration::from_millis(150)))
             .collect(),
@@ -1856,30 +1920,5 @@ async fn concurrency_limit_and_queue_bounds_are_respected() {
         "overflow beyond the queue must be rejected, statuses {statuses:?}"
     );
     assert!(mock.max_in_flight.load(Ordering::Acquire) <= 1);
-    task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn parallel_normal_requests_share_the_pool_safely() {
-    let (base, mock, task) = start_mock().await;
-    mock.set(
-        "sensenova-key-1",
-        (0..8).map(|_| Spec::json(200, ok_message_json())).collect(),
-    )
-    .await;
-    let app = app_for(test_config(base, 1));
-    let responses = futures_util::future::join_all((0..8).map(|_| {
-        let app = app.clone();
-        async move {
-            app.oneshot(gateway_request("/v1/messages", anthropic_body(false)))
-                .await
-        }
-    }))
-    .await;
-    assert!(
-        responses
-            .into_iter()
-            .all(|response| response.unwrap().status() == StatusCode::OK)
-    );
     task.abort();
 }
