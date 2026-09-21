@@ -234,7 +234,7 @@ mod tests {
             "only-this".into(),
             crate::config::ProfileConfig {
                 latency_optimized: true,
-                allow_cross_tier_fallback: false,
+                allow_lower_tier_on_unavailable: false,
                 tiers: vec![crate::config::TierConfig {
                     models: vec!["custom-model".into()],
                 }],

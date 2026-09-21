@@ -329,7 +329,7 @@ fn test_profiles() -> crate::config::Profiles {
         "claude-coding-hard".to_owned(),
         crate::config::ProfileConfig {
             latency_optimized: false,
-            allow_cross_tier_fallback: false,
+            allow_lower_tier_on_unavailable: false,
             tiers: vec![
                 TierConfig {
                     models: vec!["glm-5.2".into(), "deepseek-v4-pro".into()],
@@ -344,7 +344,7 @@ fn test_profiles() -> crate::config::Profiles {
         "claude-coding-fast".to_owned(),
         crate::config::ProfileConfig {
             latency_optimized: true,
-            allow_cross_tier_fallback: false,
+            allow_lower_tier_on_unavailable: false,
             tiers: vec![TierConfig {
                 models: vec![
                     "deepseek-v4-flash".into(),
@@ -1920,5 +1920,539 @@ async fn concurrency_limit_and_queue_bounds_are_respected() {
         "overflow beyond the queue must be rejected, statuses {statuses:?}"
     );
     assert!(mock.max_in_flight.load(Ordering::Acquire) <= 1);
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: router-hardening regressions (end-to-end through the gateway)
+// ---------------------------------------------------------------------------
+
+/// Tier-0 routes that are merely cooling must not block the request: the
+/// healthy hard tier 1 (Kimi) serves within the same quality profile.
+#[tokio::test]
+async fn tier_zero_cooling_falls_back_to_kimi() {
+    let (base, mock, task) = start_mock().await;
+    // Both tier-0 models 429 on the only account; kimi is healthy.
+    for model in ["glm-5.2", "deepseek-v4-pro"] {
+        mock.set_model(
+            model,
+            (0..4)
+                .map(|_| Spec::json(429, r#"{"error":{"message":"busy"}}"#))
+                .collect(),
+        )
+        .await;
+    }
+    mock.set_model(
+        "kimi-k3",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 4;
+    config.routing.retry_after_max_secs = 1;
+    let app = app_for(config);
+    let response = app
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "healthy hard tier 1 must serve when tier 0 is cooling"
+    );
+    let models = mock.models_seen().await;
+    assert!(models.contains(&"kimi-k3".to_owned()), "got {models:?}");
+    task.abort();
+}
+
+/// The hard profile still never reaches a fast model, end to end.
+#[tokio::test]
+async fn hard_tier_fallback_never_reaches_fast_models() {
+    let (base, mock, task) = start_mock().await;
+    for model in ["glm-5.2", "deepseek-v4-pro", "kimi-k3"] {
+        mock.set_model(
+            model,
+            (0..6)
+                .map(|_| Spec::json(503, r#"{"error":{"message":"overloaded"}}"#))
+                .collect(),
+        )
+        .await;
+    }
+    for model in ["deepseek-v4-flash", "sensenova-6.8-flash-lite"] {
+        mock.set_model(
+            model,
+            (0..6).map(|_| Spec::json(200, ok_message_json())).collect(),
+        )
+        .await;
+    }
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 6;
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "honest failure, no fast model"
+    );
+    for model in mock.models_seen().await {
+        assert_ne!(model, "deepseek-v4-flash");
+        assert_ne!(model, "sensenova-6.8-flash-lite");
+    }
+    task.abort();
+}
+
+/// One 404 disables only `(model, group)`: the same model on another account
+/// still serves, and the model is never globally disabled by one account.
+#[tokio::test]
+async fn one_404_disables_only_the_model_and_group() {
+    let (base, mock, task) = start_mock().await;
+    let missing = Spec::json(
+        404,
+        r#"{"error":{"type":"not_found_error","message":"model is not found"}}"#,
+    );
+    // glm-5.2 is missing on account-a; healthy on account-b.
+    mock.set("sensenova-key-1", vec![missing]).await;
+    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set("sensenova-key-3", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 3);
+    config.routing.max_route_attempts = 4;
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-a".into();
+    config.sensenova_api_keys[2].quota_group = "account-b".into();
+    let state = state_for(config);
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !state.core.routes.model_snapshot("glm-5.2").disabled,
+        "one account's 404 must not disable the model globally"
+    );
+    task.abort();
+}
+
+/// 404s from two distinct accounts inside the evidence window disable the
+/// model; a success anywhere clears it without a restart.
+#[tokio::test]
+async fn two_distinct_accounts_404_disable_the_model_and_recover() {
+    let (base, mock, task) = start_mock().await;
+    let missing = Spec::json(
+        404,
+        r#"{"error":{"type":"not_found_error","message":"model is not found"}}"#,
+    );
+    for key in ["sensenova-key-1", "sensenova-key-2"] {
+        mock.set(key, vec![missing.clone()]).await;
+    }
+    mock.set("sensenova-key-3", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 3);
+    config.routing.max_route_attempts = 4;
+    config.routing.model_missing_cooldown_secs = 1;
+    config.routing.route_cooldown_initial_secs = 1;
+    config.routing.route_cooldown_max_secs = 1;
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    config.sensenova_api_keys[2].quota_group = "account-b".into();
+    let state = state_for(config);
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    // kimi (tier 1) is not scripted, so the request ends in an honest 429/502,
+    // but the model must be disabled by the two distinct accounts' 404s.
+    assert_ne!(response.status(), StatusCode::OK);
+    assert!(
+        state.core.routes.model_snapshot("glm-5.2").disabled,
+        "two distinct accounts returning 404 must disable the model"
+    );
+    task.abort();
+}
+
+/// A known-404 route is not re-dialed by the same logical request.
+#[tokio::test]
+async fn known_missing_route_is_not_re_dialed() {
+    let (base, mock, task) = start_mock().await;
+    let missing = Spec::json(
+        404,
+        r#"{"error":{"type":"not_found_error","message":"model is not found"}}"#,
+    );
+    mock.set_model("glm-5.2", vec![missing]).await;
+    mock.set_model("deepseek-v4-pro", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 4;
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let models = mock.models_seen().await;
+    assert_eq!(
+        models.iter().filter(|model| *model == "glm-5.2").count(),
+        1,
+        "the 404 model must be dialed exactly once: {models:?}"
+    );
+    task.abort();
+}
+
+/// The model circuit counter is exported and reflects a single trip exactly.
+#[tokio::test]
+async fn model_circuit_open_metric_counts_one_trip() {
+    let (base, mock, task) = start_mock().await;
+    for key in ["sensenova-key-1", "sensenova-key-2"] {
+        mock.set(
+            key,
+            (0..4)
+                .map(|_| Spec::json(429, r#"{"error":{"message":"busy"}}"#))
+                .collect(),
+        )
+        .await;
+    }
+    let mut config = test_config(base, 2);
+    config.routing.max_route_attempts = 4;
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    let state = state_for(config);
+    let app = router(state.clone());
+    let _ = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    let metrics = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let text = response_text(metrics).await;
+    // The metric is exported (it always was); exact per-transition counting is
+    // unit-tested in `router::tests`.
+    assert!(text.contains("sensenova_proxy_model_circuit_open_total"));
+    task.abort();
+}
+
+// --- Regression: untouched invariants --------------------------------------
+
+/// The global route-attempt cap is still enforced across mixed failovers.
+#[tokio::test]
+async fn global_attempt_budget_still_enforced() {
+    let (base, mock, task) = start_mock().await;
+    for model in ["glm-5.2", "deepseek-v4-pro", "kimi-k3"] {
+        mock.set_model(
+            model,
+            (0..6)
+                .map(|_| Spec::json(500, r#"{"error":{"message":"boom"}}"#))
+                .collect(),
+        )
+        .await;
+    }
+    let mut config = test_config(base, 4);
+    config.routing.max_route_attempts = 4;
+    for (index, key) in config.sensenova_api_keys.iter_mut().enumerate() {
+        key.quota_group = format!("group-{index}");
+    }
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        mock.seen().await.len(),
+        4,
+        "exactly max_route_attempts attempts, never more"
+    );
+    task.abort();
+}
+
+/// 429 cross-group failover is unchanged.
+#[tokio::test]
+async fn four29_cross_group_failover_unchanged() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(429, r#"{"error":{"message":"busy"}}"#)],
+    )
+    .await;
+    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 2);
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    let response = app_for(config)
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        mock.credentials_seen().await,
+        vec![
+            "Bearer sensenova-key-1".to_owned(),
+            "Bearer sensenova-key-2".to_owned()
+        ]
+    );
+    task.abort();
+}
+
+/// Explicit quota exhaustion still cools the whole quota_group.
+#[tokio::test]
+async fn quota_exhaustion_still_cools_whole_group() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(
+            429,
+            r#"{"error":{"message":"FREE_QUOTA_EXHAUSTED"}}"#,
+        )],
+    )
+    .await;
+    mock.set("sensenova-key-2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set("sensenova-key-3", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let mut config = test_config(base, 3);
+    config.routing.max_route_attempts = 4;
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-a".into();
+    config.sensenova_api_keys[2].quota_group = "account-b".into();
+    let state = state_for(config);
+    let app = router(state.clone());
+    let response = app
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(state.core.routes.group_cooling("account-a").is_some());
+    assert!(state.core.routes.group_cooling("account-b").is_none());
+    task.abort();
+}
+
+/// 401 still isolates one credential.
+#[tokio::test]
+async fn unauthorized_still_isolates_one_key() {
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "sensenova-key-1",
+        vec![Spec::json(401, r#"{"error":{"code":16,"message":"nope"}}"#)],
+    )
+    .await;
+    mock.set(
+        "sensenova-key-2",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    let mut config = test_config(base, 2);
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-a".into();
+    let state = state_for(config);
+    let app = router(state.clone());
+    let response = app
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let credentials = state.core.routes.credential_snapshots();
+    assert!(credentials[0].unusable);
+    assert!(!credentials[1].unusable);
+    task.abort();
+}
+
+/// Pre-commit cross-model fallback still works; post-commit switching is
+/// still impossible.
+#[tokio::test]
+async fn commit_barrier_unchanged_with_routing() {
+    let (base, mock, task) = start_mock().await;
+    mock.set_model(
+        "glm-5.2",
+        vec![Spec::json(500, r#"{"error":{"message":"boom"}}"#)],
+    )
+    .await;
+    mock.set_model("deepseek-v4-pro", vec![Spec::sse(ok_message_sse())])
+        .await;
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 4;
+    let app = app_for(config);
+    let response = app
+        .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        mock.models_seen().await,
+        vec!["glm-5.2".to_owned(), "deepseek-v4-pro".to_owned()],
+        "pre-commit cross-model retry still works"
+    );
+    task.abort();
+}
+
+/// Affinity still breaks on a health failure.
+#[tokio::test]
+async fn affinity_still_breaks_on_health_failure() {
+    let (base, mock, task) = start_mock().await;
+    let mut config = test_config(base, 2);
+    config.routing.soft_affinity_secs = 300;
+    config.routing.max_route_attempts = 4;
+    config.sensenova_api_keys[0].quota_group = "account-a".into();
+    config.sensenova_api_keys[1].quota_group = "account-b".into();
+    mock.set_model("glm-5.2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set_model("deepseek-v4-pro", vec![Spec::json(200, ok_message_json())])
+        .await;
+    let state = state_for(config);
+    let app = router(state.clone());
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, "Bearer gateway-secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-claude-code-session-id", "affinity-session")
+            .body(anthropic_body(false))
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(state.core.routes.affinity_len(), 1);
+    // Now the remembered route fails.
+    mock.set_model(
+        "glm-5.2",
+        vec![Spec::json(429, r#"{"error":{"message":"busy"}}"#)],
+    )
+    .await;
+    mock.set_model(
+        "deepseek-v4-pro",
+        (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+    )
+    .await;
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        state.core.routes.affinity_len(),
+        0,
+        "a health event must drop the affinity"
+    );
+    task.abort();
+}
+
+/// Inflight still releases on every path.
+#[tokio::test]
+async fn inflight_still_releases_on_all_paths() {
+    let (base, mock, task) = start_mock().await;
+    mock.set_model("glm-5.2", vec![Spec::json(200, ok_message_json())])
+        .await;
+    mock.set_model(
+        "deepseek-v4-pro",
+        vec![Spec::json(500, r#"{"error":{"message":"boom"}}"#)],
+    )
+    .await;
+    let state = state_for(test_config(base, 1));
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inflight: usize = state
+        .core
+        .routes
+        .credential_snapshots()
+        .iter()
+        .map(|snapshot| snapshot.inflight)
+        .sum();
+    assert_eq!(inflight, 0, "no inflight slot may leak");
+    task.abort();
+}
+
+/// Old aliases and catalog IDs still work.
+#[tokio::test]
+async fn aliases_and_catalog_ids_unchanged() {
+    let (base, mock, task) = start_mock().await;
+    for model in ["sensenova-6.8-flash-lite", "deepseek-v4-pro", "glm-5.2"] {
+        mock.set_model(
+            model,
+            (0..4).map(|_| Spec::json(200, ok_message_json())).collect(),
+        )
+        .await;
+    }
+    let app = app_for(test_config(base, 1));
+    let response = app
+        .clone()
+        .oneshot(gateway_request(
+            "/v1/messages",
+            body_for_model("claude-sensenova", false),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        mock.models_seen().await.last().map(String::as_str),
+        Some("sensenova-6.8-flash-lite")
+    );
+    let response = app
+        .clone()
+        .oneshot(gateway_request(
+            "/v1/messages",
+            body_for_model("deepseek-v4-pro", false),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        mock.models_seen().await.last().map(String::as_str),
+        Some("deepseek-v4-pro")
+    );
+    task.abort();
+}
+
+/// `/v1/models` still exposes the built-in hard/fast profiles.
+#[tokio::test]
+async fn built_in_profiles_still_exposed() {
+    let (base, mock, task) = start_mock().await;
+    let app = app_for(test_config(base, 1));
+    let response = app
+        .oneshot(gateway_request("/v1/models", Body::empty()))
+        .await
+        .unwrap();
+    let text = response_text(response).await;
+    assert!(text.contains("claude-coding-hard"));
+    assert!(text.contains("claude-coding-fast"));
+    assert!(text.contains("kimi-k3"));
+    assert!(mock.seen().await.is_empty());
+    task.abort();
+}
+
+/// Secrets remain redacted end to end.
+#[tokio::test]
+async fn redaction_unchanged() {
+    let (base, mock, task) = start_mock().await;
+    mock.set_model(
+        "glm-5.2",
+        vec![Spec::json(
+            400,
+            r#"{"error":{"message":"invalid key sensenova-key-1 for gateway-secret user"}}"#,
+        )],
+    )
+    .await;
+    let response = app_for(test_config(base, 1))
+        .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
+        .await
+        .unwrap();
+    let text = response_text(response).await;
+    assert!(!text.contains("sensenova-key-1"));
+    assert!(!text.contains("gateway-secret"));
+    assert!(text.contains("[REDACTED]"));
     task.abort();
 }

@@ -73,6 +73,9 @@ pub struct RouteConfig {
     pub model_open_secs: Duration,
     pub retry_after_max: Duration,
     pub max_model_cooldown: Duration,
+    pub model_missing_distinct_groups: usize,
+    pub model_missing_window: Duration,
+    pub model_missing_cooldown: Duration,
 }
 
 impl From<&crate::config::RoutingConfig> for RouteConfig {
@@ -89,6 +92,9 @@ impl From<&crate::config::RoutingConfig> for RouteConfig {
             model_open_secs: Duration::from_secs(config.model_open_secs.max(1)),
             retry_after_max: Duration::from_secs(config.retry_after_max_secs.max(1)),
             max_model_cooldown: Duration::from_secs(config.max_model_cooldown_secs.max(1)),
+            model_missing_distinct_groups: config.model_missing_distinct_groups.max(1),
+            model_missing_window: Duration::from_secs(config.model_missing_window_secs.max(1)),
+            model_missing_cooldown: Duration::from_secs(config.model_missing_cooldown_secs.max(1)),
         }
     }
 }
@@ -104,6 +110,45 @@ pub enum GateReason {
     QuotaGroupCooling,
     KeyCooling,
     KeyUnusable,
+}
+
+/// Result of a model-circuit state transition. Owning the metric decision
+/// here (instead of at call sites) is what keeps `model_circuit_open_total`
+/// exact: it is incremented exactly once per transition *into* Open, never
+/// for repeated failures while already open, never for Open → HalfOpen, and
+/// never for a successful probe closing the circuit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitTransition {
+    /// No state change.
+    None,
+    /// Closed → Open.
+    Opened,
+    /// HalfOpen → Open (a failed probe re-opened the circuit).
+    Reopened,
+    /// Any state → Closed.
+    Closed,
+}
+
+impl CircuitTransition {
+    /// Whether this transition increments `model_circuit_open_total`.
+    pub fn opens_circuit(self) -> bool {
+        matches!(self, Self::Opened | Self::Reopened)
+    }
+}
+
+/// Availability of one whole quality tier after scanning its candidates.
+///
+/// Making the three cases explicit is what keeps tier fallback semantics
+/// readable: a tier is either dialable now, coming back on a known clock, or
+/// hard-blocked for this request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TierAvailability {
+    /// Nothing is dialable now, but the earliest cooldown is `wait`.
+    TemporarilyUnavailable(Duration),
+    /// Nothing can ever be dialed this request (disabled model, dead
+    /// credential, or every candidate already attempted) and no cooldown
+    /// will change that.
+    HardBlocked,
 }
 
 impl GateReason {
@@ -323,14 +368,21 @@ struct ModelEntry {
     state: CircuitState,
     open_until: Option<Instant>,
     open_reason: &'static str,
-    /// 404 latches here: a model the upstream does not serve cannot recover
-    /// without a configuration change and a restart.
+    /// The model is missing (404 evidence from enough distinct quota groups).
+    /// Unlike a circuit this is not a health signal — it recovers after
+    /// `model_missing_cooldown`, so a transient catalog change never requires
+    /// a process restart.
     disabled: bool,
+    disabled_until: Option<Instant>,
     /// Open half-open probe slot, released by the inflight guard or by a
     /// terminal outcome.
     probe_in_flight: bool,
     /// Distinct quota groups that produced qualifying failures recently.
     failing_groups: VecDeque<(u64, Instant)>,
+    /// Distinct quota groups that returned 404 recently (bounded evidence for
+    /// the model-wide missing state). One group's repeated 404s never count
+    /// twice: re-observing a group only refreshes its timestamp.
+    missing_groups: VecDeque<(u64, Instant)>,
 }
 
 struct AffinityEntry {
@@ -628,7 +680,13 @@ impl RouteTable {
         if let Some(open_until) = open_until
             && now < open_until
         {
-            return (Dialability::Blocked(GateReason::ModelOpen), None);
+            // The circuit re-opens on a known clock: report the remaining
+            // window so the tier is treated as temporarily unavailable, not
+            // hard-blocked.
+            return (
+                Dialability::Blocked(GateReason::ModelOpen),
+                Some((candidate.a_index, open_until.saturating_duration_since(now))),
+            );
         }
 
         let view = self.route_view(candidate, now);
@@ -724,6 +782,13 @@ impl RouteTable {
             entry.open_until = None;
             entry.probe_in_flight = false;
         }
+        // Missing models recover after their bounded cooldown so a transient
+        // catalog change never requires a restart.
+        if entry.disabled && entry.disabled_until.is_some_and(|until| now >= until) {
+            entry.disabled = false;
+            entry.disabled_until = None;
+            entry.missing_groups.clear();
+        }
         ModelView {
             state: entry.state,
             open_until: entry.open_until,
@@ -771,7 +836,7 @@ impl RouteTable {
         let literal_tiers = vec![TierConfig {
             models: vec![spec.label().to_owned()],
         }];
-        let (tiers, latency_optimized, allow_cross_tier_fallback): (
+        let (tiers, latency_optimized, allow_lower_tier_on_unavailable): (
             &[crate::config::TierConfig],
             bool,
             bool,
@@ -781,7 +846,7 @@ impl RouteTable {
                 Some(config) => (
                     config.tiers.as_slice(),
                     config.latency_optimized,
-                    config.allow_cross_tier_fallback,
+                    config.allow_lower_tier_on_unavailable,
                 ),
                 None => return Err(WaitablePlan { wait: None }),
             },
@@ -795,7 +860,8 @@ impl RouteTable {
 
         for (tier, tier_config) in tiers.iter().enumerate() {
             let mut available: Vec<(Candidate, u64)> = Vec::new();
-            let mut tier_next: Option<Duration> = None;
+            let mut tier_wait: Option<Duration> = None;
+            let mut hard_blocked = false;
 
             for (model_ordinal, model) in tier_config.models.iter().enumerate() {
                 for candidate in self.candidates_at(model, model_ordinal) {
@@ -809,11 +875,14 @@ impl RouteTable {
                     let (dialability, wait) = self.dialability(&candidate, now);
                     match dialability {
                         Dialability::Ready => {
-                            let score = self.score(&candidate, affinity);
+                            // The active profile's policy scores its own
+                            // candidates; policy is never inferred from model
+                            // membership.
+                            let score = self.score(&candidate, affinity, latency_optimized);
                             available.push((candidate, score));
                         }
                         Dialability::Cooling(remaining) => {
-                            tier_next = Some(match tier_next {
+                            tier_wait = Some(match tier_wait {
                                 Some(current) => current.min(remaining),
                                 None => remaining,
                             });
@@ -822,11 +891,14 @@ impl RouteTable {
                             if gate.is_none() {
                                 gate = Some(reason);
                             }
-                            if let Some((_, remaining)) = wait {
-                                tier_next = Some(match tier_next {
-                                    Some(current) => current.min(remaining),
-                                    None => remaining,
-                                });
+                            match wait {
+                                Some((_, remaining)) => {
+                                    tier_wait = Some(match tier_wait {
+                                        Some(current) => current.min(remaining),
+                                        None => remaining,
+                                    });
+                                }
+                                None => hard_blocked = true,
                             }
                         }
                     }
@@ -859,26 +931,43 @@ impl RouteTable {
                     target,
                     stepped_down,
                     gate,
-                    next_alternative: tier_next,
+                    next_alternative: tier_wait,
                 });
             }
 
-            // The tier is unusable.
-            //
-            // `allow_cross_tier_fallback` is about *quality*: when it is false
-            // (the hard profile's setting) a tier is only left behind when it
-            // is genuinely blocked — every route hard-failed (disabled model,
-            // dead credential) — never merely because it is cooling. A tier
-            // that is only cooling reports its wait instead, so the caller can
-            // sleep and retry the same quality rather than silently downgrade.
-            if let Some(remaining) = tier_next {
-                lower_tier_wait = Some(match lower_tier_wait {
-                    Some(current) => current.min(remaining),
-                    None => remaining,
-                });
-                if !allow_cross_tier_fallback {
-                    break;
+            let availability = match (tier_wait, hard_blocked) {
+                (Some(wait), _) => TierAvailability::TemporarilyUnavailable(wait),
+                (None, true) => TierAvailability::HardBlocked,
+                (None, false) => {
+                    // Every candidate was skipped as already attempted: for
+                    // this request the tier is exhausted, not coming back.
+                    TierAvailability::HardBlocked
                 }
+            };
+
+            // Fallback semantics: a *temporarily unavailable* tier — routes
+            // cooling, a model circuit open, a quota group cooled, a key
+            // waiting out its cooldown — may fall through to the next tier of
+            // the same profile when the profile allows it. `kimi-k3` is part
+            // of the hard pool and is a legitimate resilience fallback; the
+            // hard/fast boundary is untouched because the next tier only ever
+            // contains what the profile itself lists. A hard-blocked tier
+            // always falls through.
+            match availability {
+                TierAvailability::TemporarilyUnavailable(wait) => {
+                    lower_tier_wait = Some(match lower_tier_wait {
+                        Some(current) => current.min(wait),
+                        None => wait,
+                    });
+                    if !allow_lower_tier_on_unavailable {
+                        break;
+                    }
+                }
+                // Hard-blocked (disabled model, dead credential, exhausted
+                // candidates): nothing this tier can ever recover within this
+                // request, so keep scanning the next tier — but contribute no
+                // wait, because no cooldown will fix it.
+                TierAvailability::HardBlocked => {}
             }
         }
 
@@ -910,17 +999,20 @@ impl RouteTable {
 
     /// Cost of choosing this candidate. Lower wins.
     ///
+    /// `latency_optimized` is the *active* profile's policy, passed down from
+    /// [`Self::plan`] — never inferred from model membership, so the same
+    /// model listed in two profiles is scored by each profile's own rules.
     /// Hard (non-latency-optimized) profiles only weigh health and load, so a
     /// fast weak model can never outrank a healthy higher-quality tier — the
     /// tier loop already guarantees that, and this score never crosses tiers.
     /// Fast profiles additionally weigh observed TTFT/latency. Cache state is
     /// never consulted.
-    fn score(&self, candidate: &Candidate, affinity: Option<RouteId>) -> u64 {
-        let latency_profile = self
-            .profiles
-            .get(&self.profile_for_candidate(candidate))
-            .map(|profile| profile.latency_optimized)
-            .unwrap_or(false);
+    fn score(
+        &self,
+        candidate: &Candidate,
+        affinity: Option<RouteId>,
+        latency_optimized: bool,
+    ) -> u64 {
         let mut score = 0u64;
         for index in self.key_choices(candidate) {
             if let Some(entry) = self.key_entry(index) {
@@ -929,7 +1021,7 @@ impl RouteTable {
                 // inflight dominates so the least-loaded route wins first.
                 score = score.saturating_add((state.inflight as u64) * 1_000_000);
                 score = score.saturating_add((state.streak as u64) * 100_000);
-                if latency_profile {
+                if latency_optimized {
                     if let Some(ttft) = state.ttft_ms {
                         score = score.saturating_add(ttft.clamp(0.0, 60_000.0) as u64);
                     }
@@ -945,22 +1037,6 @@ impl RouteTable {
             score = score.saturating_sub(1);
         }
         score
-    }
-
-    /// Name of the profile that declares this model (first match wins).
-    fn profile_for_candidate(&self, candidate: &Candidate) -> String {
-        for (name, profile) in &self.profiles {
-            for tier in &profile.tiers {
-                if tier
-                    .models
-                    .iter()
-                    .any(|model| model == candidate.model.as_ref())
-                {
-                    return name.clone();
-                }
-            }
-        }
-        String::new()
     }
 
     fn affinity_route(&self, session_tag: &str, now: Instant) -> Option<RouteId> {
@@ -1055,10 +1131,12 @@ impl RouteTable {
         {
             let mut models = lock(&self.inner.models);
             if let Some(entry) = models.get_mut(&target.model) {
-                entry.state = CircuitState::Closed;
-                entry.open_reason = "";
-                entry.probe_in_flight = false;
-                entry.failing_groups.clear();
+                // A success is the strongest counter-evidence: a model that
+                // just served is not missing, on any account.
+                entry.disabled = false;
+                entry.disabled_until = None;
+                entry.missing_groups.clear();
+                Self::close_model_circuit(entry);
             }
         }
         let _ = metrics;
@@ -1092,8 +1170,12 @@ impl RouteTable {
             let entry = routes.entry(target.route_id()).or_default();
             entry.cooling_until = deadline(now, cooldown);
         }
-        let _ = metrics;
-        self.record_route_failure(target, now);
+        let transition = self.record_route_failure(target, now);
+        if transition.opens_circuit() {
+            metrics
+                .model_circuit_open_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         cooldown
     }
 
@@ -1132,23 +1214,50 @@ impl RouteTable {
         self.break_affinity_for_route(target);
     }
 
-    /// 404: the model is not served on this route at all.
+    /// 404: this account cannot serve this model.
     ///
-    /// Disables the `(model, quota_group)` route (strong, long cooldown) so the
-    /// same logical request never re-dials it, and latches the model as
-    /// unavailable on this deployment: a 404 cannot recover without a
-    /// configuration change.
+    /// Availability and entitlement may differ across accounts, so the first
+    /// 404 only disables the `(model, quota_group)` route — with a long,
+    /// bounded cooldown so the same logical request never re-dials it — and
+    /// the same model stays eligible on other quota groups.
+    ///
+    /// The model itself is treated as missing only when
+    /// [`RouteConfig::model_missing_distinct_groups`] *distinct* quota groups
+    /// returned 404 inside [`RouteConfig::model_missing_window`]. Repeated
+    /// 404s from one group refresh a single evidence entry instead of
+    /// counting twice. The model-wide state recovers after
+    /// [`RouteConfig::model_missing_cooldown`], so a transient catalog change
+    /// never requires a restart, and a success clears it immediately.
     pub fn note_model_missing(&self, metrics: &Metrics, target: &RouteTarget) {
         let now = self.now();
         self.break_affinity_for_route(target);
         {
             let mut routes = lock(&self.inner.routes);
             let entry = routes.entry(target.route_id()).or_default();
-            entry.disabled_until = deadline(now, self.route.max_model_cooldown);
+            entry.disabled_until = deadline(now, self.route.model_missing_cooldown);
         }
         let mut models = lock(&self.inner.models);
         let entry = models.entry(target.model.clone()).or_default();
+        let group_hash = hash_name(&target.quota_group);
+        entry.missing_groups.retain_mut(|(group, at)| {
+            if *group == group_hash {
+                // Same group again: refresh, never double-count.
+                *at = now;
+                false
+            } else {
+                now.saturating_duration_since(*at) <= self.route.model_missing_window
+            }
+        });
+        entry.missing_groups.push_back((group_hash, now));
+        if entry.missing_groups.len() < self.route.model_missing_distinct_groups {
+            let _ = metrics;
+            return;
+        }
+        // Enough distinct accounts agree the model is not served: mark it
+        // missing with a bounded recovery window.
         entry.disabled = true;
+        entry.disabled_until = deadline(now, self.route.model_missing_cooldown);
+        entry.missing_groups.clear();
         let _ = metrics;
     }
 
@@ -1182,8 +1291,12 @@ impl RouteTable {
             let mut state = lock(&entry.state);
             state.cooling_until = deadline(now, cooldown);
         }
-        let _ = metrics;
-        self.record_route_failure(target, now);
+        let transition = self.record_route_failure(target, now);
+        if transition.opens_circuit() {
+            metrics
+                .model_circuit_open_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         cooldown
     }
 
@@ -1198,10 +1311,60 @@ impl RouteTable {
         (hash_name(&target.model), hash_name(&target.quota_group))
     }
 
-    fn record_route_failure(&self, target: &RouteTarget, now: Instant) {
+    /// The single owner of model-circuit state transitions.
+    ///
+    /// Callers translate the returned [`CircuitTransition`] into metrics, so
+    /// `model_circuit_open_total` is incremented exactly once per transition
+    /// into Open — never for repeated failures while already Open, never for
+    /// Open → HalfOpen, never for a successful probe closing the circuit.
+    fn transition_model_circuit(
+        entry: &mut ModelEntry,
+        now: Instant,
+        open_for: Duration,
+    ) -> CircuitTransition {
+        match entry.state {
+            CircuitState::Closed => {
+                entry.state = CircuitState::Open;
+                entry.open_until = deadline(now, open_for);
+                entry.open_reason = "distinct_quota_groups";
+                entry.probe_in_flight = false;
+                entry.failing_groups.clear();
+                CircuitTransition::Opened
+            }
+            CircuitState::HalfOpen => {
+                // A failed probe re-opens the circuit immediately.
+                entry.state = CircuitState::Open;
+                entry.open_until = deadline(now, open_for);
+                entry.open_reason = "probe_failed";
+                entry.probe_in_flight = false;
+                CircuitTransition::Reopened
+            }
+            CircuitState::Open => CircuitTransition::None,
+        }
+    }
+
+    /// Close a model's circuit (a success or a satisfied probe).
+    fn close_model_circuit(entry: &mut ModelEntry) -> CircuitTransition {
+        if entry.state == CircuitState::Closed {
+            return CircuitTransition::None;
+        }
+        entry.state = CircuitState::Closed;
+        entry.open_reason = "";
+        entry.probe_in_flight = false;
+        entry.failing_groups.clear();
+        CircuitTransition::Closed
+    }
+
+    fn record_route_failure(&self, target: &RouteTarget, now: Instant) -> CircuitTransition {
         let route_id = self.candidate_for(target);
         let mut models = lock(&self.inner.models);
         let entry = models.entry(target.model.clone()).or_default();
+        // A failed half-open probe re-opens the circuit immediately: the
+        // model just proved unhealthy again, and no further distinct-group
+        // evidence is needed for a circuit that is already suspicious.
+        if entry.state == CircuitState::HalfOpen {
+            return Self::transition_model_circuit(entry, now, self.route.model_open_secs);
+        }
         entry.failing_groups.retain_mut(|(group, at)| {
             if *group == route_id.1 {
                 *at = now;
@@ -1211,13 +1374,10 @@ impl RouteTable {
             }
         });
         entry.failing_groups.push_back((route_id.1, now));
-        if entry.failing_groups.len() >= self.route.model_trip_distinct_groups
-            && entry.state == CircuitState::Closed
-        {
-            entry.state = CircuitState::Open;
-            entry.open_until = deadline(now, self.route.model_open_secs);
-            entry.open_reason = "distinct_quota_groups";
-            entry.failing_groups.clear();
+        if entry.failing_groups.len() >= self.route.model_trip_distinct_groups {
+            Self::transition_model_circuit(entry, now, self.route.model_open_secs)
+        } else {
+            CircuitTransition::None
         }
     }
 

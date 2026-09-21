@@ -44,7 +44,7 @@
     "profiles": {
       "claude-coding-hard": {
         "latency_optimized": false,
-        "allow_cross_tier_fallback": false,
+        "allow_lower_tier_on_unavailable": true,
         "tiers": [
           { "models": ["glm-5.2", "deepseek-v4-pro"] },
           { "models": ["kimi-k3"] }
@@ -52,7 +52,7 @@
       },
       "claude-coding-fast": {
         "latency_optimized": true,
-        "allow_cross_tier_fallback": false,
+        "allow_lower_tier_on_unavailable": false,
         "tiers": [{ "models": ["deepseek-v4-flash", "sensenova-6.8-flash-lite"] }]
       }
     }

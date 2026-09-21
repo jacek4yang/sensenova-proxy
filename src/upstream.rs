@@ -1032,7 +1032,9 @@ impl Core {
         }
     }
 
-    /// 404: the model is disabled, so the next attempt must use another one.
+    /// 404: the failed `(model, group)` route is disabled, so the next
+    /// attempt uses another route — the same model on another quota group
+    /// (account entitlement may differ) or, failing that, another model.
     #[allow(clippy::too_many_arguments)]
     fn next_attempt_model(
         &self,
@@ -1052,25 +1054,33 @@ impl Core {
             .routes
             .plan(spec, session_tag, attempt, skipped, metrics)
         {
-            Ok(plan) if plan.target.model_str() != failed.model_str() => {
+            Ok(plan) if plan.target.identity() != failed.identity() => {
                 metrics
                     .retries_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 metrics
-                    .model_failovers_total
+                    .route_failovers_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                metrics
-                    .cross_model_failovers_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let cross_model = plan.target.model_str() != failed.model_str();
+                if cross_model {
+                    metrics
+                        .model_failovers_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics
+                        .cross_model_failovers_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 tracing::warn!(
                     request_id,
                     model = failed.model_str(),
+                    quota_group = failed.quota_group_str(),
                     attempt,
                     next_model = plan.target.model_str(),
+                    next_quota_group = plan.target.quota_group_str(),
                     next_tier = plan.target.tier,
                     cooldown_ms = cooldown.as_millis() as u64,
-                    cross_model_failover = true,
-                    "model unavailable on this route; failing over to another model"
+                    cross_model_failover = cross_model,
+                    "model missing on this route; failing over to another route"
                 );
                 Some(None)
             }
