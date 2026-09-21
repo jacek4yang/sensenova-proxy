@@ -13,6 +13,7 @@ mod models;
 mod pool;
 mod rate_limit;
 mod redaction;
+mod router;
 mod server;
 mod sse;
 mod upstream;
@@ -47,14 +48,24 @@ async fn main() -> Result<()> {
         .iter()
         .filter(|key| key.enabled)
         .count();
+    let profiles = config.profiles();
+    let profile_names = profiles.keys().cloned().collect::<Vec<_>>().join(",");
+    let route_count = profiles
+        .values()
+        .flat_map(|profile| profile.tiers.iter())
+        .flat_map(|tier| tier.models.iter())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     tracing::info!(
         config_path = %config_path.display(),
         bind = %config.server.bind,
         upstream = %config.upstream.base_url,
         messages_path = %config.upstream.messages_path,
-        upstream_model = %config.models.default,
+        default_model = %config.models.default,
         enabled_keys,
-        max_attempts = config.retry.max_attempts,
+        profiles = profile_names,
+        routed_models = route_count,
+        max_route_attempts = config.routing.max_route_attempts,
         concurrency_limit = config.concurrency.initial,
         queue_capacity = config.concurrency.queue_capacity,
         "configuration loaded"

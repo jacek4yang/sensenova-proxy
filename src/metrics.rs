@@ -19,6 +19,17 @@ pub struct Metrics {
     pub stream_protocol_errors_total: AtomicU64,
     pub retries_total: AtomicU64,
     pub cross_group_failovers_total: AtomicU64,
+    pub route_attempts_total: AtomicU64,
+    pub route_failovers_total: AtomicU64,
+    pub model_failovers_total: AtomicU64,
+    pub model_account_429_total: AtomicU64,
+    pub model_circuit_open_total: AtomicU64,
+    pub routing_exhausted_total: AtomicU64,
+    pub affinity_hits_total: AtomicU64,
+    pub affinity_breaks_total: AtomicU64,
+    pub cross_model_failovers_total: AtomicU64,
+    pub tier_steps_total: AtomicU64,
+    pub health_excluded_total: AtomicU64,
     pub tool_calls_total: AtomicU64,
     pub queue_rejections_total: AtomicU64,
     pub circuit_state: AtomicI64,
@@ -194,6 +205,72 @@ impl Metrics {
             "sensenova_proxy_cross_group_failovers_total",
             "Failovers that switched to a different quota group.",
             self.cross_group_failovers_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_route_attempts_total",
+            "Route attempts dialed under the dynamic routing profile.",
+            self.route_attempts_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_route_failovers_total",
+            "Failovers to a different (model, quota_group) route.",
+            self.route_failovers_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_model_failovers_total",
+            "Failovers that changed the upstream model within one request.",
+            self.model_failovers_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_cross_model_failovers_total",
+            "Failovers that changed the upstream model (alias of model_failovers_total).",
+            self.cross_model_failovers_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_model_account_429_total",
+            "Generic 429 responses attributed to one (model, quota_group) route.",
+            self.model_account_429_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_model_circuit_open_total",
+            "Model-wide circuit openings (distinct quota groups tripped the model).",
+            self.model_circuit_open_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_routing_exhausted_total",
+            "Logical requests whose route-attempt budget was exhausted.",
+            self.routing_exhausted_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_affinity_hits_total",
+            "Attempts that reused the session's affinity route.",
+            self.affinity_hits_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_affinity_breaks_total",
+            "Affinities dropped because a route became unhealthy.",
+            self.affinity_breaks_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_tier_steps_total",
+            "Times a request had to step down to a lower quality tier.",
+            self.tier_steps_total.load(Ordering::Relaxed),
+            &mut output,
+        );
+        counter(
+            "sensenova_proxy_health_excluded_total",
+            "Candidates excluded by a health gate (cooldown or open circuit).",
+            self.health_excluded_total.load(Ordering::Relaxed),
             &mut output,
         );
         counter(

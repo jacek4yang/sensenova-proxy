@@ -12,8 +12,11 @@ over one or more configured SenseNova API keys, adding the pieces the upstream
 does not provide:
 
 - gateway authentication and model aliasing,
-- bounded, provably safe retries,
-- robust 429 / quota / overload handling with cooldowns and a circuit breaker,
+- **dynamic virtual-model routing** with quality-tier isolation
+  (`claude-coding-hard` / `claude-coding-fast`) across multiple accounts,
+- bounded, provably safe retries with **one global route-attempt budget**,
+- robust 429 / quota / overload handling with per-route cooldowns and
+  hierarchical circuits,
 - local concurrency shaping (bounded queue, no unbounded growth),
 - secret redaction in every error path,
 - streaming validation and observability.
@@ -34,19 +37,28 @@ sensenova-proxy  (Axum, 127.0.0.1:8789)
     │  · auth middleware (constant-time)     · request IDs
     │  · model aliasing + normalization      · bounded body limits
     │  · admission control (semaphore + bounded queue)
-    │  · retry loop (pre-commit only)        · circuit breaker
-    │  · credential pool with quota groups   · secret redaction
+    │  · virtual-model routing profiles       · secret redaction
+    │  · bounded route-attempt loop (pre-commit only)
+    │  · hierarchical circuits (route → model)
     ▼
 https://token.sensenova.cn/v1/messages   (native Anthropic compatibility)
 ```
 
+Routing chain:
+
+```
+client model → routing profile → quality tier → upstream model → quota group → API key
+```
+
 - `src/config.rs` — file-backed configuration and startup validation.
+- `src/router.rs` — routing profiles, quality tiers, and the hierarchical
+  failure domains (`key` / `quota_group` / `(model, quota_group)` / `model`).
 - `src/server.rs` — routes, middleware, the stream pump, graceful shutdown.
 - `src/upstream.rs` — one long-lived rustls `reqwest::Client`; classification,
-  retry, failover, and the pre-commit buffering that makes retries safe.
+  the route-attempt loop, and the pre-commit buffering that makes retries safe.
 - `src/rate_limit.rs` — error classification and `Retry-After` parsing.
-- `src/pool.rs` — sticky credential selection with quota-group semantics.
-- `src/circuit.rs` — Closed / Open / HalfOpen circuit breaker.
+- `src/pool.rs` — the configured credential set (identity + quota group).
+- `src/circuit.rs` — the proxy-wide Closed / Open / HalfOpen circuit breaker.
 - `src/concurrency.rs` — semaphore + bounded wait queue.
 - `src/sse.rs` — bounded incremental SSE parser (stream validation only; the
   passthrough bytes are never rewritten).
@@ -76,7 +88,7 @@ reasoning quirks) but is intentionally not used in v1.
 | `POST /v1/messages/count_tokens`| yes           | Local conservative estimate (no upstream call).|
 | `GET /v1/models`                | yes           | Deterministic local catalog.                   |
 | `GET /healthz`                  | no            | Liveness.                                      |
-| `GET /readyz`                   | loopback only | Readiness: usable credentials, circuit state.  |
+| `GET /readyz`                   | loopback only | Readiness: usable routes, credentials, circuit state. |
 | `GET /metrics`                  | loopback only | Prometheus text format.                        |
 
 When bound to a non-loopback address, `/readyz` and `/metrics` require the
@@ -117,6 +129,25 @@ fields are rejected at startup.
   "models":      { "default": "sensenova-6.8-flash-lite",
                    "map_unknown_to_default": true,
                    "aliases": { "claude-sensenova": "sensenova-6.8-flash-lite" } },
+  "routing":     {
+    "max_route_attempts": 4, "soft_affinity_secs": 300,
+    "max_affinity_entries": 4096, "same_route_429_retries": 0,
+    "route_cooldown_initial_secs": 10, "route_cooldown_max_secs": 120,
+    "model_trip_distinct_groups": 2, "model_trip_window_secs": 20,
+    "model_open_secs": 30, "retry_after_max_secs": 120,
+    "max_model_cooldown_secs": 86400,
+    "profiles": {
+      "claude-coding-hard": {
+        "latency_optimized": false, "allow_cross_tier_fallback": false,
+        "tiers": [ { "models": ["glm-5.2", "deepseek-v4-pro"] },
+                   { "models": ["kimi-k3"] } ]
+      },
+      "claude-coding-fast": {
+        "latency_optimized": true, "allow_cross_tier_fallback": false,
+        "tiers": [ { "models": ["deepseek-v4-flash", "sensenova-6.8-flash-lite"] } ]
+      }
+    }
+  },
   "retry":       { "max_attempts": 2 },
   "concurrency": { "initial": 2, "minimum": 1, "maximum": 8,
                    "queue_capacity": 32, "queue_timeout_secs": 120 },
@@ -132,8 +163,19 @@ Startup rejects: empty gateway/SenseNova keys, control characters in keys,
 duplicate or zero enabled credentials, invalid bind address or URL, embedded
 URL credentials, zero timeouts, inconsistent concurrency bounds
 (`1 ≤ minimum ≤ initial ≤ maximum ≤ 64`), `retry.max_attempts` outside 1–4,
-and invalid tracing filters. Validation errors identify keys by index only
+and invalid tracing filters.
+
+The `routing` section is validated just as strictly: unknown fields anywhere
+(including inside a profile), empty profile/tier/model lists, a model listed in
+two tiers of the same profile, `allow_cross_tier_fallback` on a single-tier
+profile, zero or impossible durations, `route_cooldown_initial_secs >
+route_cooldown_max_secs`, and out-of-range bounds are all rejected at startup.
+Validation errors identify the offending field (and profile/tier index) only,
 and never print key values.
+
+`routing` is optional: omit it and the built-in `claude-coding-hard` /
+`claude-coding-fast` pair is used, so existing configurations keep working
+unchanged.
 
 #### Using DeepSeek V4 Pro (and other catalog models)
 
@@ -161,6 +203,157 @@ even when Claude Code does not ask for thinking; `thinking:
 {"type":"disabled"}` suppresses them), upstream responses report a dated
 snapshot such as `deepseek-v4-pro-0813`, and its advertised 1M context is
 upstream metadata (not independently verified here).
+
+## Dynamic model routing
+
+Routing is the proxy's core feature: a client asks for a **virtual model**, and
+the proxy decides which upstream model, on which account, through which key to
+use — per attempt.
+
+```
+client model → routing profile → quality tier → upstream model → quota group → API key
+```
+
+### The two built-in profiles
+
+| Profile | Tier 0 | Tier 1 | Purpose |
+| ------- | ------ | ------ | ------- |
+| `claude-coding-hard` | `glm-5.2`, `deepseek-v4-pro` | `kimi-k3` | Agent-quality work. |
+| `claude-coding-fast` | `deepseek-v4-flash`, `sensenova-6.8-flash-lite` | — | Latency/health work. |
+
+Isolation is absolute:
+
+- **`claude-coding-hard` never selects `deepseek-v4-flash` or
+  `sensenova-6.8-flash-lite`.** They are not in the profile, so no failure
+  pattern can reach them.
+- **Quality outranks latency, always.** Tier 0 is exhausted (all routes
+  hard-failed) before tier 1 is considered — a faster model is never chosen
+  over a higher-quality one that is merely slower.
+- **If every hard route fails, you get an honest failure**, never a silent
+  downgrade to a weak model.
+- `claude-coding-fast` contains only fast models; it can never reach a
+  quality model.
+
+### Claude Code setup
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8789
+export ANTHROPIC_AUTH_TOKEN="$SENSENOVA_PROXY_GATEWAY_KEY"
+
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-coding-hard
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-coding-hard
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-coding-fast
+export ANTHROPIC_MODEL=claude-coding-hard
+
+export API_TIMEOUT_MS=600000
+claude
+```
+
+Both virtual names and every concrete model in the profiles are listed by
+`GET /v1/models`, so Claude Code's model picker shows them. Old aliases
+(`claude-sensenova`, `claude-deepseek`, …) and explicit SenseNova catalog IDs
+still work exactly as before.
+
+### Hierarchical failure domains
+
+Every failure cools exactly the thing that failed — never more:
+
+| Failure | Cools | Does *not* affect |
+| ------- | ----- | ----------------- |
+| Generic 429 (TPM/capacity) | one `(model, quota_group)` route | the same model on another account; another model on the same account |
+| Explicit quota exhaustion (`FREE_QUOTA_EXHAUSTED`) | the whole `quota_group` | other quota groups and other models |
+| 401 | that one credential | siblings in the same quota group |
+| 404 model not found | that model (latched) | other models |
+| 5xx / transport / EOF before first byte | the `(model, quota_group)` route, briefly | everything else |
+
+A **model-wide circuit** opens only when qualifying failures arrive from
+`routing.model_trip_distinct_groups` (default **2**) distinct quota groups
+inside `routing.model_trip_window_secs` (default **20 s**). One failing account
+can therefore never globally disable a model; the model is also half-open
+probed after `routing.model_open_secs` (default **30 s**) and closes again on a
+successful probe.
+
+### 429 behaviour
+
+A 429 means "this route is busy right now", so the proxy moves horizontally:
+
+```
+glm-5.2 / account-A  →  429  →  cool (glm-5.2, account-A)
+glm-5.2 / account-B  →  429  →  cool (glm-5.2, account-B)
+                              →  2 distinct groups: open the glm-5.2 model circuit
+deepseek-v4-pro      →  healthy  →  served
+```
+
+It never does `429 → sleep → retry the identical route` while another healthy
+route exists. `routing.same_route_429_retries` defaults to **0** for that
+reason; it only becomes reachable when literally nothing else is dialable, and
+the wait is then bounded by `routing.retry_after_max_secs`.
+
+An authoritative `Retry-After` always wins: it is used verbatim for the
+cooldown and forwarded to the client (bounded only by
+`routing.max_model_cooldown_secs`, so a hostile hint cannot park a route
+forever). Without one, the cooldown ladder is bounded exponential with jitter:
+**10 s → 20 s → 40 s → 80 s → 120 s cap** (`route_cooldown_initial_secs` →
+`route_cooldown_max_secs`, capped there).
+
+### One global retry budget
+
+`routing.max_route_attempts` (default **4**) is the *only* attempt counter, and
+it covers every kind of failover.
+
+Good, and what the proxy does:
+
+```
+1. glm-5.2       / account-A
+2. glm-5.2       / account-B
+3. deepseek-v4-pro / account-A
+4. kimi-k3       / account-C
+```
+
+Never (no nested retry loop can multiply the budget):
+
+```
+glm-5.2/A → glm-5.2/A again → glm-5.2/B → glm-5.2/B again → deepseek/A → ...
+```
+
+### Load distribution
+
+Equivalent healthy routes take turns (a rotation over the configured
+candidates) instead of always dialing the first key, and the choice prefers the
+route with **fewer in-flight requests** and a **lower recent-failure penalty**.
+In-flight counts are held by an RAII guard, so success, error, timeout and
+client-disconnect paths all release them.
+
+For `latency_optimized` profiles (the fast one) the score also weighs observed
+time-to-first-byte and total latency EWMAs. The hard profile scores only health
+and load, and only *inside* a tier — latency can never promote a weaker model.
+
+### Session affinity is a hint, not a cache
+
+Weak, bounded, behavioural affinity keeps one Claude Code session on the route
+it already used, for at most `routing.soft_affinity_secs` (default **300 s**).
+
+- It uses the existing hashed, non-reversible session tag; no session data is
+  stored, and the raw identifier is never logged.
+- State is bounded by `routing.max_affinity_entries` (default **4096**);
+  expired entries are reclaimed.
+- It is broken immediately on a 429, a cooldown, an open circuit, a relevant
+  5xx, or any unhealthy route — and only an uninterrupted first-try success
+  re-establishes it.
+- It reorders candidates **inside the already-chosen tier only**: it can never
+  override health, and it can never override quality-tier rules.
+
+**It has nothing to do with prompt caching.** Cache state is not read, not
+scored, and never influences a routing decision.
+
+### Streaming safety is unchanged
+
+The commit barrier still governs everything: a streaming request is committed
+to the client with its first SSE byte, and that byte is buffered *before* the
+response is handed over. Every routing, cooldown and failover decision
+therefore happens strictly before any observable output. After commit the proxy
+never retries, never switches account, never switches model, and never splices
+two upstream streams.
 
 ## Multiple API keys and quota groups
 
@@ -210,15 +403,19 @@ export SENSENOVA_PROXY_GATEWAY_KEY="$(choose a long random secret)"
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8789
 export ANTHROPIC_AUTH_TOKEN="$SENSENOVA_PROXY_GATEWAY_KEY"
 
-export ANTHROPIC_MODEL=claude-sensenova
-export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sensenova
-export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sensenova
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-sensenova
+# Virtual routing profiles (see "Dynamic model routing" above).
+export ANTHROPIC_MODEL=claude-coding-hard
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-coding-hard
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-coding-hard
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-coding-fast
 
 export API_TIMEOUT_MS=600000
 
 claude
 ```
+
+`claude-sensenova` and friends keep working as aliases if you prefer the older
+single-model behaviour.
 
 Both `Authorization: Bearer <key>` and `x-api-key: <key>` are accepted. The
 gateway key never travels upstream; the SenseNova credential is attached only
@@ -243,33 +440,32 @@ capacity), not credit exhaustion, and is handled as such.
 
 ### Retry budget (anti-amplification)
 
-At most `retry.max_attempts` upstream attempts per logical request, and any
-single credential is attempted at most `1 + retry.max_same_key_retries`
-times (default 4 total / 1 same-key replay). When another usable credential
-exists, **failover is always preferred over replaying the same request** —
-immediately re-submitting a large prompt against the account that just
-failed only amplifies the burst. "HTTP 200 whose stream ends before the
-first byte" is treated as potentially having consumed upstream scheduler
-work: it gets at most one same-key replay with 1–1.5 s of backoff, then
-failover or a clean error for Claude Code to handle.
+`routing.max_route_attempts` (default **4**) is a single, global budget per
+logical request: quality-tier fallback, quota-group failover, key failover and
+any same-route replay all draw from it, and nothing nests. When another usable
+route exists, **failover is always preferred over replaying the same route** —
+immediately re-submitting a large prompt against the route that just failed
+only amplifies the burst. "HTTP 200 whose stream ends before the first byte" is
+treated as potentially having consumed upstream scheduler work: it fails over
+rather than being replayed.
 
 ### Generic 429 cooldown ladder
 
-A generic 429 with an authoritative `Retry-After` always uses it. Without
-one, the credential cooldown escalates per consecutive generic 429 —
-~5 s → 10 s → 20 s → 40 s → capped at 60 s (`rate_limit_fallback_*_secs`,
-with jitter) — instead of the previous fixed 60 s that made one transient
-limit look like a minute-long outage. A success resets the ladder.
+A generic 429 with an authoritative `Retry-After` always uses it (the same
+value is forwarded to the client). Without one, the route cooldown escalates
+per consecutive generic 429 — 10 s → 20 s → 40 s → 80 s → capped at 120 s
+(`routing.route_cooldown_*`, with jitter). A success resets the ladder.
 
-- **429 with another usable key** → immediate failover (bounded by key count).
-- **429 with a short `Retry-After` (≤ 10 s) and no other key** → the proxy
-  waits out the hint once within its attempt budget, then retries the same
-  key.
-- **429 otherwise** → the credential cools down and the client receives HTTP
-  429 with a `Retry-After` header so Claude Code's own backoff can take over.
-- **Generic 429s never open the global circuit** — one account's TPM limit
-  says nothing about other accounts; per-key cooldown plus failover is the
-  whole response.
+- **429 with another usable route** → immediate failover, preferring a
+  different quota group (same account, same model → different account).
+- **429 with nothing else dialable** → the proxy returns HTTP 429 with a
+  `Retry-After` header so Claude Code's own backoff can take over. It only
+  waits a cooldown out in-request when `routing.same_route_429_retries > 0`
+  and the wait is within `routing.retry_after_max_secs`.
+- **Generic 429s never open the proxy-wide circuit** — one account's TPM limit
+  says nothing about other accounts. They cool exactly one
+  `(model, quota_group)` route; the model-wide circuit needs failures from
+  distinct quota groups.
 - **Quota exhaustion** → only *explicit* evidence promotes a 429 to quota
   exhaustion (`FREE_QUOTA_EXHAUSTED` and equivalent quota-scoped wording;
   never a plain 429 and never Google-style code 8 alone, which usually means
@@ -281,18 +477,19 @@ limit look like a minute-long outage. A success resets the ladder.
   `overload_open_secs` and requests fail fast without dialing SenseNova.
 - **401** → that credential is marked unusable (readiness reflects it);
   remaining keys still serve. **403** fails over but does not disable the key
-  (it may be model-level).
-- **400/404/422** → sanitized passthrough, never retried, never fail over.
+  (it may be model-level). **404** disables that model route and fails over to
+  another model — it is never dialed twice for the same request.
+- **400/422** → sanitized passthrough, never retried, never fail over.
 
 Body text merely containing "429" never classifies as a rate limit.
 
 ## Retry guarantees
 
-- At most `retry.max_attempts` (default **2**) upstream attempts per logical
-  request. Claude Code already retries; the proxy never multiplies its loop.
+- At most `routing.max_route_attempts` (default **4**) upstream attempts per
+  logical request. Claude Code already retries; the proxy never multiplies its
+  loop, and no nested retry path can exceed this single budget.
 - Retries happen only for provably safe classes (transport failures, 5xx,
-  queue timeouts, 429 per above) and only with bounded, jittered backoff
-  (250 ms → 4 s, capped).
+  queue timeouts, 429 per above) and only with bounded, jittered cooldowns.
 - **The commit barrier:** a streaming request is committed to the client with
   its first SSE byte. The first upstream chunk is buffered *before* the
   response is handed to the client, so every retry decision strictly precedes
@@ -365,15 +562,19 @@ circuit while your dashboard still shows remaining credits.
 
 - **Startup: `server.api_key must not be empty`** — choose a local gateway key
   separate from the SenseNova key.
-- **HTTP 429 `all SenseNova API keys are currently rate-limited`** — wait for
-  the earliest cooldown (see the `Retry-After` header) or add another enabled
-  key and restart.
+- **HTTP 429 `all configured routes are cooling down; retry shortly`** — every
+  route in the profile is cooling. Wait for the `Retry-After` header, add
+  another account (`quota_group`) or another model to the profile, and restart.
 - **HTTP 429 `circuit open (quota_exhausted)`** — the account's quota signal
   opened the circuit; it will half-open automatically. Check your Token Plan
   balance at https://token.sensenova.cn.
+- **HTTP 503 `no usable upstream route is configured for this model`** — no
+  route in the selected profile can be dialed at all (every model 404'd, every
+  credential rejected). `readyz` reports `usable_routes` and
+  `usable_credentials`.
 - **HTTP 401 `authentication_error`** — a configured SenseNova key was
-  rejected and disabled; correct it in `config.json` and restart. `readyz`
-  reports `usable_credentials`.
+  rejected and disabled; correct it in `config.json` and restart. Other
+  credentials in other quota groups keep serving.
 - **`could not reach the SenseNova upstream`** — DNS/TLS/firewall problem;
   the request was not retried on another credential.
 - **`upstream stream ended before message_stop`** — the provider closed the
@@ -394,12 +595,17 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 Coverage includes: passthrough fidelity (byte-exact fragmented SSE), model
-aliasing, tool-use streaming, mid-stream failure without replay, malformed
-SSE, client-disconnect cancellation, direct 429 with `Retry-After` (seconds
-and HTTP-date parsing, property-tested), quota exhaustion with circuit
-opening, 401 failover and readiness, transient-retry budgets, false-positive
-"429" text rejection, secret redaction, header ownership, concurrency limits
-with bounded-queue rejection, and metrics.
+aliasing and literal pass-through, tool-use streaming, mid-stream failure
+without replay, malformed SSE, client-disconnect cancellation, direct 429 with
+`Retry-After` (seconds and HTTP-date parsing, property-tested), quota
+exhaustion with cross-group failover, 401 isolation, transient-retry budgets,
+false-positive "429" text rejection, secret redaction, header ownership,
+concurrency limits with bounded-queue rejection, and metrics — plus the routing
+suite: hard/fast pool isolation (hard can never reach a fast model), tier
+ordering, one-429-cools-one-route, distinct-group model tripping, half-open
+recovery, cooldown bounds and jitter, the global attempt cap, affinity
+hit/expiry/break/bounding, load spreading, in-flight accounting on every path,
+latency scoring, and cross-model pre-commit retry.
 
 Live behavior was additionally verified against the real endpoint with a real
 key during development (text, streaming, tool calls, a genuine 429 episode,

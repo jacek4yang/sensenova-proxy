@@ -7,31 +7,17 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::error::ProtocolError;
 
-/// Resolve a client-requested model name to the upstream model.
-///
-/// `map_unknown_to_default` protects against Claude Code's built-in model
-/// names (`claude-*`, e.g. the small fast model) 404-ing upstream. Any other
-/// unknown name — such as an explicit SenseNova catalog ID like
-/// `deepseek-v4-pro` — passes through unchanged so it can be served (or
-/// honestly 404) upstream instead of being silently rewritten to the default.
-pub fn resolve_model(config: &Config, requested: &str) -> String {
-    if let Some(target) = config.models.aliases.get(requested) {
-        return target.clone();
-    }
-    if requested == config.models.default {
-        return requested.to_owned();
-    }
-    if config.models.map_unknown_to_default && requested.starts_with("claude") {
-        config.models.default.clone()
-    } else {
-        requested.to_owned()
-    }
-}
-
 pub fn model_ids(config: &Config) -> Vec<String> {
     let mut models = vec![config.models.default.clone()];
+    // Virtual routing aliases first so Claude Code sees them in `/v1/models`.
+    models.extend(config.profiles().keys().cloned());
     models.extend(config.models.aliases.keys().cloned());
     models.extend(config.models.aliases.values().cloned());
+    for profile in config.profiles().values() {
+        for tier in &profile.tiers {
+            models.extend(tier.models.iter().cloned());
+        }
+    }
     models.sort();
     models.dedup();
     models
@@ -217,49 +203,49 @@ mod tests {
     }
 
     #[test]
-    fn aliases_resolve_and_unknown_maps_to_default() {
+    fn model_ids_include_profile_aliases_and_pool_models() {
         let config = test_config();
-        assert_eq!(
-            resolve_model(&config, "claude-sensenova"),
-            "sensenova-6.8-flash-lite"
-        );
-        assert_eq!(
-            resolve_model(&config, "claude-3-5-haiku-20241022"),
-            "sensenova-6.8-flash-lite"
-        );
-        assert_eq!(
-            resolve_model(&config, "sensenova-6.8-flash-lite"),
-            "sensenova-6.8-flash-lite"
-        );
-        let mut config = test_config();
-        config.models.map_unknown_to_default = false;
-        assert_eq!(resolve_model(&config, "something-else"), "something-else");
+        let ids = model_ids(&config);
+        // Virtual routing aliases are advertised to Claude Code.
+        assert!(ids.contains(&"claude-coding-hard".to_owned()));
+        assert!(ids.contains(&"claude-coding-fast".to_owned()));
+        // Configured aliases and their targets remain present.
+        assert!(ids.contains(&"claude-sensenova".to_owned()));
+        assert!(ids.contains(&"sensenova-6.8-flash-lite".to_owned()));
+        // Every model reachable through a profile is listed.
+        for model in ["glm-5.2", "deepseek-v4-pro", "kimi-k3", "deepseek-v4-flash"] {
+            assert!(
+                ids.contains(&model.to_owned()),
+                "missing {model} in {ids:?}"
+            );
+        }
+        // The list is sorted and deduplicated.
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids, sorted);
     }
 
     #[test]
-    fn explicit_sensenova_catalog_ids_pass_through_unchanged() {
-        // A direct request for a non-default SenseNova catalog model must not
-        // be silently rewritten to the default (multi-model support).
-        let config = test_config();
-        assert_eq!(resolve_model(&config, "deepseek-v4-pro"), "deepseek-v4-pro");
-        assert_eq!(resolve_model(&config, "glm-5.2"), "glm-5.2");
-        // Claude-family names are the ones protected by the default mapping.
-        assert_eq!(
-            resolve_model(&config, "claude-sonnet-4-6"),
-            "sensenova-6.8-flash-lite"
-        );
-    }
-
-    #[test]
-    fn deepseek_alias_resolves_to_deepseek_catalog_id() {
+    fn configured_profiles_are_reflected_in_the_catalog() {
         let mut config = test_config();
-        config
-            .models
-            .aliases
-            .insert("claude-deepseek".into(), "deepseek-v4-pro".into());
-        assert_eq!(resolve_model(&config, "claude-deepseek"), "deepseek-v4-pro");
-        // And the resolved target is itself stable under resolution.
-        assert_eq!(resolve_model(&config, "deepseek-v4-pro"), "deepseek-v4-pro");
+        let mut profiles = crate::config::Profiles::new();
+        profiles.insert(
+            "only-this".into(),
+            crate::config::ProfileConfig {
+                latency_optimized: true,
+                allow_cross_tier_fallback: false,
+                tiers: vec![crate::config::TierConfig {
+                    models: vec!["custom-model".into()],
+                }],
+            },
+        );
+        config.routing.profiles = profiles;
+        let ids = model_ids(&config);
+        assert!(ids.contains(&"only-this".to_owned()));
+        assert!(ids.contains(&"custom-model".to_owned()));
+        // A configured profile section replaces the built-in pair.
+        assert!(!ids.contains(&"claude-coding-hard".to_owned()));
     }
 
     #[test]

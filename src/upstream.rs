@@ -8,7 +8,7 @@
 //! this function; the caller streams what it receives without any further
 //! replay path.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,35 +21,31 @@ use crate::circuit::{Admission, CircuitBreaker, CircuitState};
 use crate::config::{Config, defaults};
 use crate::error::error_type_for_status;
 use crate::metrics::Metrics;
-use crate::pool::{FailoverMode, KeyPool, SelectedKey};
+use crate::pool::KeyPool;
 use crate::rate_limit::{
-    RetryHintSource, UpstreamErrorClass, classify_upstream_error, fallback_rate_limit_cooldown,
-    transport_error_class,
+    RetryHintSource, UpstreamErrorClass, classify_upstream_error, transport_error_class,
 };
+use crate::router::{Followup, RouteSpec, RouteTable, RouteTarget, cap_cooldown, retry_after_for};
 
 #[derive(Clone)]
 pub struct Core {
     pub http: reqwest::Client,
     pub messages_url: reqwest::Url,
+    /// Retained for the credential surface (`/readyz`, `/metrics`) and for the
+    /// legacy non-routing code paths; routing decisions use `routes`.
     pub pool: KeyPool,
+    pub routes: RouteTable,
     pub circuit: Arc<CircuitBreaker>,
     pub secrets: Arc<Vec<String>>,
-    retry: crate::config::RetryConfig,
     anthropic_version: HeaderValue,
     first_byte_timeout: Duration,
     max_quota_cooldown: Duration,
     rate_limit_fallback_initial: Duration,
-    rate_limit_fallback_max: Duration,
-}
-
-/// What to do after a pre-commit transient failure.
-enum RetryPlan {
-    /// Continue with a different credential.
-    Failover(SelectedKey),
-    /// Replay the same credential after backing off.
-    SameKey(Duration),
-    /// Budget exhausted; surface the failure to the client.
-    Exhausted,
+    #[allow(dead_code)]
+    spec: RouteSpec,
+    max_route_attempts: usize,
+    same_route_429_retries: usize,
+    retry_after_max: Duration,
 }
 
 #[derive(Debug)]
@@ -57,7 +53,7 @@ pub enum UpstreamOutcome {
     /// Non-stream exchange completed; the body was read, bounded, and parsed.
     Json {
         body: Bytes,
-        key: SelectedKey,
+        target: RouteTarget,
         attempt: usize,
     },
     /// Stream established; the first non-empty chunk is already buffered so
@@ -65,7 +61,7 @@ pub enum UpstreamOutcome {
     Stream {
         first_chunk: Bytes,
         rest: reqwest::Response,
-        key: SelectedKey,
+        target: RouteTarget,
         attempt: usize,
     },
 }
@@ -103,203 +99,202 @@ impl Core {
         secrets.push(config.server.api_key.clone());
         let anthropic_version = HeaderValue::from_str(&config.upstream.anthropic_version)
             .context("upstream.anthropic_version must be HTTP-header-safe")?;
+        let pool = KeyPool::new(&config.sensenova_api_keys);
+        let routes = RouteTable::new(config, pool.clone());
+        let route = routes.route_config().clone();
         Ok(Self {
             http,
             messages_url: config.messages_url()?,
-            pool: KeyPool::new(&config.sensenova_api_keys),
+            pool,
+            routes,
             circuit: Arc::new(CircuitBreaker::new(
                 config.circuit.overload_threshold,
                 config.circuit.overload_window_secs,
                 config.circuit.overload_open_secs,
             )),
             secrets: Arc::new(secrets),
-            retry: config.retry.clone(),
             anthropic_version,
             first_byte_timeout: Duration::from_secs(config.upstream.first_byte_timeout_secs),
             max_quota_cooldown: Duration::from_secs(config.circuit.max_quota_cooldown_secs),
             rate_limit_fallback_initial: Duration::from_secs(
                 config.retry.rate_limit_fallback_initial_secs,
             ),
-            rate_limit_fallback_max: Duration::from_secs(config.retry.rate_limit_fallback_max_secs),
+            spec: RouteSpec::Profile(config.default_profile()),
+            max_route_attempts: route.max_route_attempts,
+            same_route_429_retries: route.same_route_429_retries,
+            retry_after_max: route.retry_after_max,
         })
     }
 
-    /// Send one logical `/v1/messages` request with bounded, TPM-aware
-    /// retrying.
+    /// Send one logical `/v1/messages` request through the routing table.
     ///
-    /// Retry budget: at most `retry.max_attempts` upstream attempts per
-    /// logical request, and any single credential is attempted at most
-    /// `1 + retry.max_same_key_retries` times. When another usable
-    /// credential exists, failover is always preferred over replaying the
-    /// same (possibly large) request against a credential that just failed —
-    /// SenseNova serving limits (TPM/concurrency/capacity) are per account,
-    /// so immediate same-key replay only amplifies the burst.
+    /// Retry budget: exactly `routing.max_route_attempts` upstream attempts per
+    /// logical request, whatever mix of model, quota group and credential they
+    /// use. Every attempt draws from that one counter — there is no nested
+    /// retry loop that can multiply it. Failover is always preferred over
+    /// replaying the same `(model, group, key)` route.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_messages(
         &self,
         metrics: &Metrics,
-        body: Bytes,
         stream: bool,
         request_id: &str,
         client_model: &str,
-        upstream_model: &str,
+        canonical: &Bytes,
         session_tag: &str,
+        spec: &RouteSpec,
     ) -> std::result::Result<UpstreamOutcome, GatewayError> {
-        let mut attempted: HashSet<usize> = HashSet::with_capacity(self.pool.len());
-        let mut same_key_retries: HashMap<usize, usize> = HashMap::new();
+        let mut skipped: HashSet<(u64, u64, usize)> = HashSet::new();
+        let mut same_route_retries = 0usize;
         let mut attempt = 0usize;
-        let mut current = self.pool.select(&attempted);
-        loop {
-            // Circuit check before every attempt.
-            match self.circuit.admit() {
-                Admission::Refused { remaining, reason } => {
-                    tracing::warn!(
-                        request_id,
-                        circuit_reason = reason,
-                        cooldown_ms = remaining.as_millis() as u64,
-                        "circuit open; refusing upstream call without dialing SenseNova"
-                    );
-                    return Err(GatewayError {
-                        status: StatusCode::TOO_MANY_REQUESTS,
-                        message: format!(
-                            "upstream temporarily unavailable (circuit open: {reason})"
-                        ),
-                        class: UpstreamErrorClass::RateLimited,
-                        retry_after: Some(remaining),
-                        sanitized_body: None,
-                    });
-                }
-                Admission::Allowed => {}
-            }
+        let mut last_error: Option<GatewayError> = None;
 
-            let Some(selected) = current else {
-                for snapshot in self.pool.snapshots() {
-                    tracing::debug!(
-                        request_id,
-                        credential = %snapshot.name,
-                        quota_group = %snapshot.quota_group,
-                        cooling_remaining_ms = snapshot
-                            .cooling_remaining
-                            .map(|duration| duration.as_millis() as u64)
-                            .unwrap_or(0),
-                        unusable = snapshot.unusable,
-                        "credential state at exhaustion"
-                    );
-                }
+        loop {
+            if attempt >= self.max_route_attempts {
+                metrics
+                    .routing_exhausted_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(
                     request_id,
-                    configured_keys = self.pool.len(),
-                    "all credentials are cooling or unusable"
+                    attempt,
+                    budget = self.max_route_attempts,
+                    "route-attempt budget exhausted"
                 );
-                // No upstream call happened, but a HalfOpen probe slot
-                // (if this request held one) must be released.
-                self.circuit.record_neutral_failure();
+                return Err(last_error.unwrap_or_else(|| GatewayError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    message: "all routing options for this request were exhausted".into(),
+                    class: UpstreamErrorClass::RateLimited,
+                    retry_after: self.routes.earliest_retry_after(),
+                    sanitized_body: None,
+                }));
+            }
+
+            let plan = match self
+                .routes
+                .plan(spec, session_tag, attempt, &skipped, metrics)
+            {
+                Ok(plan) => plan,
+                Err(waitable) => return Err(self.route_unavailable(waitable, request_id)),
+            };
+
+            // Pre-dial health gate: the global circuit still guards a
+            // proxy-wide upstream outage, but a single model's circuit no
+            // longer blocks healthy models.
+            if let Admission::Refused { remaining, reason } = self.circuit.admit() {
+                tracing::warn!(
+                    request_id,
+                    circuit_reason = reason,
+                    cooldown_ms = remaining.as_millis() as u64,
+                    "circuit open; refusing upstream call without dialing SenseNova"
+                );
                 return Err(GatewayError {
                     status: StatusCode::TOO_MANY_REQUESTS,
-                    message: "all SenseNova API keys are currently rate-limited or unavailable"
-                        .into(),
+                    message: format!("upstream temporarily unavailable (circuit open: {reason})"),
                     class: UpstreamErrorClass::RateLimited,
-                    retry_after: self.pool.earliest_retry_after(),
+                    retry_after: Some(remaining),
                     sanitized_body: None,
                 });
-            };
-            attempted.insert(selected.index);
+            }
+
+            let target = plan.target.clone();
+            let stepped_down = plan.stepped_down;
+            let gate = plan.gate.map(|gate| gate.as_str()).unwrap_or("");
+            let cross_group = !skipped.is_empty()
+                && skipped
+                    .iter()
+                    .any(|(_, group, _)| *group != plan.target.identity().1);
             attempt += 1;
+            skipped.insert(target.identity());
+            metrics
+                .route_attempts_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             metrics
                 .upstream_requests_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let started = Instant::now();
 
+            // Per-attempt model rewrite: the canonical body is never mutated,
+            // so a retry can safely switch models.
+            let attempt_body = match rewrite_model(canonical, &target.model) {
+                Ok(body) => body,
+                Err(error) => return Err(error),
+            };
+
+            tracing::info!(
+                request_id,
+                client_model,
+                model = target.model_str(),
+                profile = spec.label(),
+                tier = target.tier,
+                stepped_down,
+                gate,
+                credential = %target.key.name,
+                quota_group = target.quota_group_str(),
+                session_tag,
+                attempt,
+                cross_group,
+                max_attempts = self.max_route_attempts,
+                "route attempt"
+            );
+
+            let started = Instant::now();
+            let mut guard = self.routes.begin_attempt(&target);
             let response = match self
-                .send_once(&selected, body.clone(), stream, request_id, upstream_model)
+                .send_once(&target, attempt_body, stream, request_id)
                 .await
             {
                 Ok(response) => response,
                 Err(error) => {
+                    metrics
+                        .upstream_transport_errors_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.circuit.record_overload();
+                    let cooldown = self.routes.note_transient_failure(
+                        metrics,
+                        &target,
+                        attempt,
+                        None,
+                        pseudo_jitter(),
+                    );
+                    self.routes.break_affinity(metrics, session_tag);
                     let class = if error.is_timeout() {
                         UpstreamErrorClass::QueueTimeout
                     } else {
                         UpstreamErrorClass::TransportTransient
                     };
-                    metrics
-                        .upstream_transport_errors_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.circuit.record_overload();
-                    match self.plan_retry(
-                        &attempted,
-                        &mut same_key_retries,
-                        &selected,
+                    let failure = GatewayError {
+                        status: StatusCode::BAD_GATEWAY,
+                        message: "could not reach the SenseNova upstream".into(),
+                        class,
+                        retry_after: None,
+                        sanitized_body: None,
+                    };
+                    drop(guard);
+                    if let Some(next) = self.next_attempt(
+                        spec,
+                        metrics,
+                        &target,
+                        &mut skipped,
+                        &mut same_route_retries,
                         attempt,
-                        FailoverMode::PreferOtherGroup,
+                        session_tag,
+                        "transport_error",
+                        error_class(&error),
+                        cooldown,
+                        request_id,
                     ) {
-                        RetryPlan::Failover(next) => {
-                            metrics
-                                .retries_total
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let cross_group = next.quota_group != selected.quota_group;
-                            if cross_group {
-                                metrics
-                                    .cross_group_failovers_total
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            tracing::warn!(
-                                request_id,
-                                credential = %selected.name,
-                                quota_group = %selected.quota_group,
-                                attempt,
-                                retry_reason = "transport_error",
-                                same_key_retry = false,
-                                next_credential = %next.name,
-                                next_quota_group = %next.quota_group,
-                                cross_group_failover = cross_group,
-                                error_class = transport_error_class(&error),
-                                "upstream transport failure before commit; failing over"
-                            );
-                            current = Some(next);
-                            continue;
+                        last_error = Some(failure);
+                        if let Some(wait) = next {
+                            tokio::time::sleep(wait).await;
                         }
-                        RetryPlan::SameKey(backoff) => {
-                            metrics
-                                .retries_total
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                request_id,
-                                credential = %selected.name,
-                                attempt,
-                                retry_reason = "transport_error",
-                                same_key_retry = true,
-                                backoff_ms = backoff.as_millis() as u64,
-                                error_class = transport_error_class(&error),
-                                "upstream transport failure before commit; retrying the same key"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            current = Some(selected);
-                            continue;
-                        }
-                        RetryPlan::Exhausted => {
-                            tracing::error!(
-                                request_id,
-                                credential = %selected.name,
-                                attempt,
-                                error_class = transport_error_class(&error),
-                                "upstream transport failure; not retrying"
-                            );
-                            return Err(GatewayError {
-                                status: StatusCode::BAD_GATEWAY,
-                                message: "could not reach the SenseNova upstream".into(),
-                                class,
-                                retry_after: None,
-                                sanitized_body: None,
-                            });
-                        }
+                        continue;
                     }
+                    return Err(failure);
                 }
             };
 
             let status = response.status();
             if status.is_success() {
                 if stream {
-                    // Pre-commit: buffer the first non-empty chunk.
                     let mut rest = response;
                     let first = tokio::time::timeout(self.first_byte_timeout, async {
                         loop {
@@ -307,8 +302,6 @@ impl Core {
                                 Ok(Some(chunk)) if !chunk.is_empty() => {
                                     break Ok::<Bytes, FirstByteFailure>(chunk);
                                 }
-                                // Empty chunks are legal keepalives; EOF
-                                // before any byte is a protocol failure.
                                 Ok(Some(_)) => continue,
                                 Ok(None) => break Err(FirstByteFailure::Eof),
                                 Err(error) => break Err(FirstByteFailure::Transport(error)),
@@ -318,23 +311,35 @@ impl Core {
                     .await;
                     match first {
                         Ok(Ok(chunk)) => {
-                            metrics.note_time_to_first_event(started.elapsed());
-                            self.pool.note_credential_success(selected.index);
+                            let ttft = started.elapsed();
+                            metrics.note_time_to_first_event(ttft);
+                            self.routes.note_success(metrics, &target, Some(ttft), ttft);
+                            if attempt == 1 {
+                                // Only an uninterrupted first-try success
+                                // establishes affinity: a request that had to
+                                // fail over must not re-pin the session to
+                                // whatever eventually answered.
+                                self.routes
+                                    .note_session_route(metrics, session_tag, &target);
+                            }
+                            self.circuit.record_success();
+                            guard.release_probe();
                             tracing::info!(
                                 request_id,
+                                model = target.model_str(),
                                 client_model,
-                                upstream_model,
                                 session_tag,
-                                credential = %selected.name,
+                                credential = %target.key.name,
+                                quota_group = target.quota_group_str(),
+                                tier = target.tier,
                                 attempt,
-                                first_byte_ms = started.elapsed().as_millis() as u64,
-                                "SenseNova stream established"
+                                first_byte_ms = ttft.as_millis() as u64,
+                                "stream established; commit barrier reached"
                             );
-                            self.circuit.record_success();
                             return Ok(UpstreamOutcome::Stream {
                                 first_chunk: chunk,
                                 rest,
-                                key: selected,
+                                target,
                                 attempt,
                             });
                         }
@@ -359,224 +364,151 @@ impl Core {
                                     UpstreamErrorClass::TransportTransient
                                 }
                             };
-                            // A 200 whose stream ends before any byte has
-                            // still likely consumed scheduler work; replays
-                            // must be rare, backed off, and prefer a fresh
-                            // credential over the same one.
-                            match self.plan_retry(
-                                &attempted,
-                                &mut same_key_retries,
-                                &selected,
+                            let cooldown = self.routes.note_transient_failure(
+                                metrics,
+                                &target,
                                 attempt,
-                                FailoverMode::PreferOtherGroup,
+                                None,
+                                pseudo_jitter(),
+                            );
+                            self.routes.break_affinity(metrics, session_tag);
+                            let result = GatewayError {
+                                status: StatusCode::BAD_GATEWAY,
+                                message: "upstream stream ended before any output".into(),
+                                class,
+                                retry_after: None,
+                                sanitized_body: None,
+                            };
+                            drop(guard);
+                            if let Some(wait) = self.next_attempt(
+                                spec,
+                                metrics,
+                                &target,
+                                &mut skipped,
+                                &mut same_route_retries,
+                                attempt,
+                                session_tag,
+                                "stream_eof_before_first_byte",
+                                first_byte_failure,
+                                cooldown,
+                                request_id,
                             ) {
-                                RetryPlan::Failover(next) => {
-                                    metrics
-                                        .retries_total
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    let cross_group = next.quota_group != selected.quota_group;
-                                    if cross_group {
-                                        metrics
-                                            .cross_group_failovers_total
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    tracing::warn!(
-                                        request_id,
-                                        credential = %selected.name,
-                                        quota_group = %selected.quota_group,
-                                        attempt,
-                                        retry_reason = "stream_eof_before_first_byte",
-                                        same_key_retry = false,
-                                        next_credential = %next.name,
-                                        next_quota_group = %next.quota_group,
-                                        cross_group_failover = cross_group,
-                                        first_byte_failure,
-                                        "stream failed before first byte; failing over"
-                                    );
-                                    current = Some(next);
-                                    continue;
+                                last_error = Some(result);
+                                if let Some(wait) = wait {
+                                    tokio::time::sleep(wait).await;
                                 }
-                                RetryPlan::SameKey(backoff) => {
-                                    metrics
-                                        .retries_total
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!(
-                                        request_id,
-                                        credential = %selected.name,
-                                        attempt,
-                                        retry_reason = "stream_eof_before_first_byte",
-                                        same_key_retry = true,
-                                        backoff_ms = backoff.as_millis() as u64,
-                                        first_byte_failure,
-                                        "stream failed before first byte; retrying the same key"
-                                    );
-                                    tokio::time::sleep(backoff).await;
-                                    current = Some(selected);
-                                    continue;
-                                }
-                                RetryPlan::Exhausted => {
-                                    return Err(GatewayError {
-                                        status: StatusCode::BAD_GATEWAY,
-                                        message: "upstream stream ended before any output".into(),
-                                        class,
-                                        retry_after: None,
-                                        sanitized_body: None,
-                                    });
-                                }
+                                continue;
                             }
+                            return Err(result);
                         }
                         Err(_timeout) => {
                             self.circuit.record_overload();
-                            let class = UpstreamErrorClass::QueueTimeout;
-                            match self.plan_retry(
-                                &attempted,
-                                &mut same_key_retries,
-                                &selected,
+                            let cooldown = self.routes.note_transient_failure(
+                                metrics,
+                                &target,
                                 attempt,
-                                FailoverMode::PreferOtherGroup,
+                                None,
+                                pseudo_jitter(),
+                            );
+                            self.routes.break_affinity(metrics, session_tag);
+                            let result = GatewayError {
+                                status: StatusCode::GATEWAY_TIMEOUT,
+                                message: "upstream produced no output before the deadline".into(),
+                                class: UpstreamErrorClass::QueueTimeout,
+                                retry_after: None,
+                                sanitized_body: None,
+                            };
+                            drop(guard);
+                            if let Some(wait) = self.next_attempt(
+                                spec,
+                                metrics,
+                                &target,
+                                &mut skipped,
+                                &mut same_route_retries,
+                                attempt,
+                                session_tag,
+                                "first_byte_timeout",
+                                "timeout",
+                                cooldown,
+                                request_id,
                             ) {
-                                RetryPlan::Failover(next) => {
-                                    metrics
-                                        .retries_total
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    let cross_group = next.quota_group != selected.quota_group;
-                                    if cross_group {
-                                        metrics
-                                            .cross_group_failovers_total
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    tracing::warn!(
-                                        request_id,
-                                        credential = %selected.name,
-                                        quota_group = %selected.quota_group,
-                                        attempt,
-                                        retry_reason = "first_byte_timeout",
-                                        same_key_retry = false,
-                                        next_credential = %next.name,
-                                        next_quota_group = %next.quota_group,
-                                        cross_group_failover = cross_group,
-                                        first_byte_failure = "timeout",
-                                        "no first byte before the deadline; failing over"
-                                    );
-                                    current = Some(next);
-                                    continue;
+                                last_error = Some(result);
+                                if let Some(wait) = wait {
+                                    tokio::time::sleep(wait).await;
                                 }
-                                RetryPlan::SameKey(backoff) => {
-                                    metrics
-                                        .retries_total
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!(
-                                        request_id,
-                                        credential = %selected.name,
-                                        attempt,
-                                        retry_reason = "first_byte_timeout",
-                                        same_key_retry = true,
-                                        backoff_ms = backoff.as_millis() as u64,
-                                        first_byte_failure = "timeout",
-                                        "no first byte before the deadline; retrying the same key"
-                                    );
-                                    tokio::time::sleep(backoff).await;
-                                    current = Some(selected);
-                                    continue;
-                                }
-                                RetryPlan::Exhausted => {
-                                    return Err(GatewayError {
-                                        status: StatusCode::GATEWAY_TIMEOUT,
-                                        message: "upstream produced no output before the deadline"
-                                            .into(),
-                                        class,
-                                        retry_after: None,
-                                        sanitized_body: None,
-                                    });
-                                }
+                                continue;
                             }
+                            return Err(result);
                         }
                     }
                 }
 
-                // Non-stream: buffer and validate the whole body.
                 let bytes = read_limited(response, defaults::MAX_UPSTREAM_RESPONSE_BYTES).await;
                 if serde_json::from_slice::<Value>(&bytes).is_ok() {
+                    let elapsed = started.elapsed();
+                    self.routes.note_success(metrics, &target, None, elapsed);
+                    if attempt == 1 {
+                        self.routes
+                            .note_session_route(metrics, session_tag, &target);
+                    }
+                    self.circuit.record_success();
+                    guard.release_probe();
                     tracing::info!(
                         request_id,
                         client_model,
-                        upstream_model,
+                        model = target.model_str(),
+                        tier = target.tier,
+                        credential = %target.key.name,
+                        quota_group = target.quota_group_str(),
                         session_tag,
-                        credential = %selected.name,
                         attempt,
-                        duration_ms = started.elapsed().as_millis() as u64,
+                        duration_ms = elapsed.as_millis() as u64,
                         response_bytes = bytes.len(),
-                        "SenseNova JSON response buffered"
+                        "JSON response buffered"
                     );
-                    self.pool.note_credential_success(selected.index);
-                    self.circuit.record_success();
                     return Ok(UpstreamOutcome::Json {
                         body: bytes,
-                        key: selected,
+                        target,
                         attempt,
                     });
                 }
                 self.circuit.record_overload();
-                let class = UpstreamErrorClass::ServerTransient;
-                match self.plan_retry(
-                    &attempted,
-                    &mut same_key_retries,
-                    &selected,
+                let cooldown = self.routes.note_transient_failure(
+                    metrics,
+                    &target,
                     attempt,
-                    FailoverMode::PreferOtherGroup,
+                    None,
+                    pseudo_jitter(),
+                );
+                self.routes.break_affinity(metrics, session_tag);
+                let result = GatewayError {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: "upstream returned invalid JSON".into(),
+                    class: UpstreamErrorClass::ServerTransient,
+                    retry_after: None,
+                    sanitized_body: None,
+                };
+                drop(guard);
+                if let Some(wait) = self.next_attempt(
+                    spec,
+                    metrics,
+                    &target,
+                    &mut skipped,
+                    &mut same_route_retries,
+                    attempt,
+                    session_tag,
+                    "malformed_upstream_json",
+                    "invalid_json",
+                    cooldown,
+                    request_id,
                 ) {
-                    RetryPlan::Failover(next) => {
-                        metrics
-                            .retries_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let cross_group = next.quota_group != selected.quota_group;
-                        if cross_group {
-                            metrics
-                                .cross_group_failovers_total
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        tracing::warn!(
-                            request_id,
-                            credential = %selected.name,
-                            quota_group = %selected.quota_group,
-                            attempt,
-                            retry_reason = "malformed_upstream_json",
-                            same_key_retry = false,
-                            next_credential = %next.name,
-                            next_quota_group = %next.quota_group,
-                            cross_group_failover = cross_group,
-                            "upstream returned malformed JSON before commit; failing over"
-                        );
-                        current = Some(next);
-                        continue;
+                    last_error = Some(result);
+                    if let Some(wait) = wait {
+                        tokio::time::sleep(wait).await;
                     }
-                    RetryPlan::SameKey(backoff) => {
-                        metrics
-                            .retries_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::warn!(
-                            request_id,
-                            credential = %selected.name,
-                            attempt,
-                            retry_reason = "malformed_upstream_json",
-                            same_key_retry = true,
-                            backoff_ms = backoff.as_millis() as u64,
-                            "upstream returned malformed JSON before commit; retrying the same key"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        current = Some(selected);
-                        continue;
-                    }
-                    RetryPlan::Exhausted => {
-                        return Err(GatewayError {
-                            status: StatusCode::BAD_GATEWAY,
-                            message: "upstream returned invalid JSON".into(),
-                            class,
-                            retry_after: None,
-                            sanitized_body: None,
-                        });
-                    }
+                    continue;
                 }
+                return Err(result);
             }
 
             // Error status: buffer, classify, and decide.
@@ -603,113 +535,60 @@ impl Core {
                 });
             let hint = classification.retry_hint.clone();
             let message = sanitized_message(&sanitized, default_message_for_status(status));
+            let classification_reason = classification.reason.as_str();
+            let upstream_error_code = classification.numeric_code;
+            let upstream_error_kind = classification.error_kind.as_deref().unwrap_or("");
+            let hint_source = hint
+                .as_ref()
+                .map(|hint| hint.source.as_str())
+                .unwrap_or("none");
 
             match class {
                 UpstreamErrorClass::RateLimited => {
                     metrics
                         .upstream_429_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // Deliberately NOT record_overload(): a per-credential
-                    // generic 429 (TPM/concurrency/capacity) says nothing
-                    // about other quota groups, and the per-key cooldown plus
-                    // failover already protects the upstream. Five generic
-                    // 429s must never global-block healthy groups.
+                    metrics
+                        .model_account_429_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Deliberately NOT record_overload(): a per-route generic
+                    // 429 says nothing about other quota groups, and the route
+                    // cooldown plus failover already protects the upstream.
                     let fallback_hint = hint
                         .as_ref()
                         .is_some_and(|hint| hint.source == RetryHintSource::Fallback);
-                    let cooldown = if fallback_hint {
-                        let streak = self.pool.rate_limit_streak(selected.index);
-                        self.pool.note_rate_limit(selected.index);
-                        fallback_rate_limit_cooldown(
-                            streak,
-                            self.rate_limit_fallback_initial,
-                            self.rate_limit_fallback_max,
-                            pseudo_jitter(),
-                        )
+                    let streak = if fallback_hint {
+                        self.routes.rate_limit_streak(&target)
                     } else {
-                        // Authoritative upstream information supersedes the
-                        // transient ladder.
-                        self.pool.reset_rate_limit_streak(selected.index);
-                        hint.as_ref().map(|hint| hint.duration).unwrap_or_default()
+                        0
                     };
-                    self.pool.mark_key_cooling(selected.index, cooldown);
-                    let hint_source = hint
-                        .as_ref()
-                        .map(|hint| hint.source.as_str())
-                        .unwrap_or("progressive_fallback");
-                    let classification_reason = classification.reason.as_str();
-                    let upstream_error_code = classification.numeric_code;
-                    let upstream_error_kind = classification.error_kind.as_deref().unwrap_or("");
-                    // Prefer immediate failover to another credential —
-                    // a different quota group first (the 429 is likely an
-                    // account-level serving limit shared by same-group keys).
-                    if attempt < self.retry.max_attempts {
-                        if let Some(next) = self.pool.select_for_failover(
-                            &attempted,
-                            Some(&selected.quota_group),
-                            FailoverMode::PreferOtherGroup,
-                        ) {
-                            metrics
-                                .retries_total
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                request_id,
-                                credential = %selected.name,
-                                attempt,
-                                classification = class.as_str(),
-                                classification_reason,
-                                upstream_error_code,
-                                upstream_error_kind,
-                                cooldown_ms = cooldown.as_millis() as u64,
-                                hint_source,
-                                retry_reason = "rate_limited",
-                                same_key_retry = false,
-                                next_credential = %next.name,
-                                "rate limited before commit; failing over to the next key"
-                            );
-                            current = Some(next);
-                            continue;
-                        }
-                        // No alternative credential: a SHORT authoritative
-                        // hint or the short progressive cooldown may be
-                        // waited out once, within the same-key budget.
-                        let short = cooldown
-                            <= Duration::from_secs(self.retry.max_retry_after_secs_for_retry);
-                        let used = same_key_retries.entry(selected.index).or_insert(0);
-                        if self.retry.retry_429_with_short_retry_after
-                            && short
-                            && *used < self.retry.max_same_key_retries
-                        {
-                            *used += 1;
-                            metrics
-                                .retries_total
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                request_id,
-                                credential = %selected.name,
-                                attempt,
-                                classification = class.as_str(),
-                                classification_reason,
-                                upstream_error_code,
-                                upstream_error_kind,
-                                cooldown_ms = cooldown.as_millis() as u64,
-                                hint_source,
-                                retry_reason = "rate_limited",
-                                same_key_retry = true,
-                                backoff_ms = cooldown.as_millis() as u64,
-                                "short rate limit before commit; waiting out the hint on the same key"
-                            );
-                            tokio::time::sleep(
-                                cooldown + backoff_duration(&self.retry, attempt, pseudo_jitter()),
-                            )
-                            .await;
-                            current = Some(selected);
-                            continue;
-                        }
-                    }
+                    let cooldown = self.routes.note_rate_limited(
+                        metrics,
+                        &target,
+                        attempt,
+                        streak,
+                        if fallback_hint {
+                            None
+                        } else {
+                            hint.as_ref().map(|hint| hint.duration)
+                        },
+                        pseudo_jitter(),
+                    );
+                    self.routes.break_affinity(metrics, session_tag);
+                    let result = GatewayError {
+                        status: StatusCode::TOO_MANY_REQUESTS,
+                        message: message.clone(),
+                        class,
+                        retry_after: Some(retry_after_for(cooldown)),
+                        sanitized_body: Some(sanitized.clone()),
+                    };
+                    drop(guard);
                     tracing::warn!(
                         request_id,
-                        credential = %selected.name,
+                        credential = %target.key.name,
+                        quota_group = target.quota_group_str(),
+                        model = target.model_str(),
+                        tier = target.tier,
                         attempt,
                         classification = class.as_str(),
                         classification_reason,
@@ -717,15 +596,28 @@ impl Core {
                         upstream_error_kind,
                         cooldown_ms = cooldown.as_millis() as u64,
                         hint_source,
-                        "upstream rate limit; returning 429 to client"
+                        "generic 429; cooling (model, quota_group) only"
                     );
-                    return Err(GatewayError {
-                        status: StatusCode::TOO_MANY_REQUESTS,
-                        message,
-                        class,
-                        retry_after: Some(cooldown),
-                        sanitized_body: Some(sanitized),
-                    });
+                    if let Some(wait) = self.next_attempt(
+                        spec,
+                        metrics,
+                        &target,
+                        &mut skipped,
+                        &mut same_route_retries,
+                        attempt,
+                        session_tag,
+                        "rate_limited",
+                        "rate_limited",
+                        cooldown,
+                        request_id,
+                    ) {
+                        last_error = Some(result);
+                        if let Some(wait) = wait {
+                            tokio::time::sleep(wait).await;
+                        }
+                        continue;
+                    }
+                    return Err(result);
                 }
                 UpstreamErrorClass::QuotaExhausted => {
                     metrics
@@ -737,106 +629,136 @@ impl Core {
                     let cooldown = hint
                         .as_ref()
                         .map(|hint| hint.duration)
-                        .unwrap_or(Duration::from_secs(3_600))
-                        .clamp(Duration::from_secs(1), self.max_quota_cooldown);
-                    if classification.quota_group_exhausted {
-                        self.pool
-                            .mark_group_cooling(&selected.quota_group, cooldown);
-                    } else {
-                        self.pool.mark_key_cooling(selected.index, cooldown);
-                    }
-                    // Open the global circuit only when no credential remains
-                    // usable. With another quota group still available, the
-                    // group cooling above already protects the exhausted
-                    // domain; a global circuit would wrongly block those
-                    // other groups too.
-                    let circuit_opened = if self.pool.usable_count() == 0 {
+                        .unwrap_or(Duration::from_secs(3_600));
+                    let cooldown = cap_cooldown(cooldown, self.max_quota_cooldown);
+                    self.routes.note_quota_exhausted(metrics, &target, cooldown);
+                    self.routes.break_affinity(metrics, session_tag);
+                    let circuit_opened = self.routes.usable_route_count() == 0;
+                    if circuit_opened {
                         self.circuit.record_quota_exhaustion(cooldown);
-                        true
-                    } else {
-                        false
-                    };
+                    }
                     tracing::error!(
                         request_id,
-                        credential = %selected.name,
-                        quota_group = %selected.quota_group,
+                        credential = %target.key.name,
+                        quota_group = target.quota_group_str(),
+                        model = target.model_str(),
                         attempt,
                         classification = class.as_str(),
-                        classification_reason = classification.reason.as_str(),
-                        upstream_error_code = classification.numeric_code,
-                        upstream_error_kind = classification.error_kind.as_deref().unwrap_or(""),
+                        classification_reason,
+                        upstream_error_code,
+                        upstream_error_kind,
                         circuit_opened,
                         cooldown_ms = cooldown.as_millis() as u64,
-                        "quota exhaustion; cooling the failure domain"
+                        "quota exhaustion; cooling the whole quota_group"
                     );
-                    // Same-request cross-group failover: the exhausted group
-                    // is already cooling, so only a *different* quota group
-                    // can be selected. Never a same-key replay for quota
-                    // exhaustion — the whole failure domain is gone.
-                    if attempt < self.retry.max_attempts
-                        && let Some(next) = self.pool.select_for_failover(
-                            &attempted,
-                            Some(&selected.quota_group),
-                            FailoverMode::RequireOtherGroup,
-                        )
-                    {
-                        metrics
-                            .retries_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        metrics
-                            .cross_group_failovers_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::warn!(
-                            request_id,
-                            credential = %selected.name,
-                            quota_group = %selected.quota_group,
-                            attempt,
-                            same_request_failover = true,
-                            next_credential = %next.name,
-                            next_quota_group = %next.quota_group,
-                            "quota exhaustion; failing over to another quota group"
-                        );
-                        current = Some(next);
-                        continue;
-                    }
-                    return Err(GatewayError {
+                    let result = GatewayError {
                         status: StatusCode::TOO_MANY_REQUESTS,
                         message,
                         class,
-                        retry_after: Some(cooldown),
+                        retry_after: Some(retry_after_for(cooldown)),
                         sanitized_body: Some(sanitized),
-                    });
+                    };
+                    drop(guard);
+                    // The exhausted group is fully cooled; only a different
+                    // group can serve, and never a same-route replay.
+                    if let Some(wait) = self.next_attempt_group(
+                        spec,
+                        metrics,
+                        &target,
+                        &mut skipped,
+                        attempt,
+                        session_tag,
+                        cooldown,
+                        request_id,
+                    ) {
+                        last_error = Some(result);
+                        if let Some(wait) = wait {
+                            tokio::time::sleep(wait).await;
+                        }
+                        continue;
+                    }
+                    return Err(result);
                 }
                 UpstreamErrorClass::Authentication | UpstreamErrorClass::Permission => {
                     if class == UpstreamErrorClass::Authentication {
-                        // A rejected credential can never recover in-process.
-                        self.pool.mark_unusable(selected.index);
+                        self.routes.note_authentication_failure(&target);
                     }
+                    self.routes.break_affinity(metrics, session_tag);
                     self.circuit.record_neutral_failure();
-                    // Credential problems are per-key: failover only, never a
-                    // same-key replay of a rejected credential.
-                    if attempt < self.retry.max_attempts
-                        && let Some(next) = self.pool.select(&attempted)
-                    {
-                        tracing::error!(
-                            request_id,
-                            credential = %selected.name,
-                            attempt,
-                            retry_reason = "credential_rejected",
-                            same_key_retry = false,
-                            next_credential = %next.name,
-                            "credential rejected before commit; failing over to the next key"
-                        );
-                        current = Some(next);
-                        continue;
-                    }
-                    return Err(GatewayError {
+                    let result = GatewayError {
                         status,
                         message,
                         class,
                         retry_after: None,
                         sanitized_body: Some(sanitized),
-                    });
+                    };
+                    drop(guard);
+                    tracing::error!(
+                        request_id,
+                        credential = %target.key.name,
+                        quota_group = target.quota_group_str(),
+                        model = target.model_str(),
+                        attempt,
+                        classification = class.as_str(),
+                        "credential rejected; failing over without disabling the account"
+                    );
+                    if let Some(wait) = self.next_attempt(
+                        spec,
+                        metrics,
+                        &target,
+                        &mut skipped,
+                        &mut same_route_retries,
+                        attempt,
+                        session_tag,
+                        "credential_rejected",
+                        "credential_rejected",
+                        Duration::ZERO,
+                        request_id,
+                    ) {
+                        last_error = Some(result);
+                        if let Some(wait) = wait {
+                            tokio::time::sleep(wait).await;
+                        }
+                        continue;
+                    }
+                    return Err(result);
+                }
+                UpstreamErrorClass::NotFound => {
+                    self.routes.note_model_missing(metrics, &target);
+                    self.routes.break_affinity(metrics, session_tag);
+                    self.circuit.record_neutral_failure();
+                    let result = GatewayError {
+                        status,
+                        message,
+                        class,
+                        retry_after: None,
+                        sanitized_body: Some(sanitized),
+                    };
+                    drop(guard);
+                    tracing::warn!(
+                        request_id,
+                        model = target.model_str(),
+                        tier = target.tier,
+                        attempt,
+                        "model not served on this route; disabled and failing over"
+                    );
+                    if let Some(wait) = self.next_attempt_model(
+                        spec,
+                        metrics,
+                        &target,
+                        &mut skipped,
+                        attempt,
+                        session_tag,
+                        Duration::from_secs(1),
+                        request_id,
+                    ) {
+                        last_error = Some(result);
+                        if let Some(wait) = wait {
+                            tokio::time::sleep(wait).await;
+                        }
+                        continue;
+                    }
+                    return Err(result);
                 }
                 UpstreamErrorClass::ServerTransient
                 | UpstreamErrorClass::QueueTimeout
@@ -845,74 +767,59 @@ impl Core {
                         .upstream_5xx_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.circuit.record_overload();
-                    match self.plan_retry(
-                        &attempted,
-                        &mut same_key_retries,
-                        &selected,
+                    let cooldown = self.routes.note_transient_failure(
+                        metrics,
+                        &target,
                         attempt,
-                        FailoverMode::PreferOtherGroup,
+                        hint.as_ref().map(|hint| hint.duration),
+                        pseudo_jitter(),
+                    );
+                    self.routes.break_affinity(metrics, session_tag);
+                    let result = GatewayError {
+                        status: if status == StatusCode::REQUEST_TIMEOUT {
+                            StatusCode::GATEWAY_TIMEOUT
+                        } else {
+                            status
+                        },
+                        message,
+                        class,
+                        retry_after: None,
+                        sanitized_body: Some(sanitized),
+                    };
+                    drop(guard);
+                    tracing::warn!(
+                        request_id,
+                        credential = %target.key.name,
+                        quota_group = target.quota_group_str(),
+                        model = target.model_str(),
+                        tier = target.tier,
+                        attempt,
+                        upstream_status = status.as_u16(),
+                        cooldown_ms = cooldown.as_millis() as u64,
+                        "transient upstream failure before commit; failing over"
+                    );
+                    if let Some(wait) = self.next_attempt(
+                        spec,
+                        metrics,
+                        &target,
+                        &mut skipped,
+                        &mut same_route_retries,
+                        attempt,
+                        session_tag,
+                        "http_5xx",
+                        "http_5xx",
+                        cooldown,
+                        request_id,
                     ) {
-                        RetryPlan::Failover(next) => {
-                            metrics
-                                .retries_total
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let cross_group = next.quota_group != selected.quota_group;
-                            if cross_group {
-                                metrics
-                                    .cross_group_failovers_total
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            tracing::warn!(
-                                request_id,
-                                credential = %selected.name,
-                                quota_group = %selected.quota_group,
-                                attempt,
-                                upstream_status = status.as_u16(),
-                                retry_reason = "http_5xx",
-                                same_key_retry = false,
-                                next_credential = %next.name,
-                                next_quota_group = %next.quota_group,
-                                cross_group_failover = cross_group,
-                                "transient upstream failure before commit; failing over"
-                            );
-                            current = Some(next);
-                            continue;
+                        last_error = Some(result);
+                        if let Some(wait) = wait {
+                            tokio::time::sleep(wait).await;
                         }
-                        RetryPlan::SameKey(backoff) => {
-                            metrics
-                                .retries_total
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                request_id,
-                                credential = %selected.name,
-                                attempt,
-                                upstream_status = status.as_u16(),
-                                retry_reason = "http_5xx",
-                                same_key_retry = true,
-                                backoff_ms = backoff.as_millis() as u64,
-                                "transient upstream failure before commit; retrying the same key"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            current = Some(selected);
-                            continue;
-                        }
-                        RetryPlan::Exhausted => {
-                            return Err(GatewayError {
-                                status: if status == StatusCode::REQUEST_TIMEOUT {
-                                    StatusCode::GATEWAY_TIMEOUT
-                                } else {
-                                    status
-                                },
-                                message,
-                                class,
-                                retry_after: None,
-                                sanitized_body: Some(sanitized),
-                            });
-                        }
+                        continue;
                     }
+                    return Err(result);
                 }
                 UpstreamErrorClass::InvalidRequest
-                | UpstreamErrorClass::NotFound
                 | UpstreamErrorClass::Unknown
                 | UpstreamErrorClass::StreamInterrupted => {
                     self.circuit.record_neutral_failure();
@@ -928,53 +835,13 @@ impl Core {
         }
     }
 
-    /// Decide the next attempt after a pre-commit transient failure:
-    /// failover first — preferring a *different quota group* when the
-    /// failure looks account/serving-level — and a same-key replay only
-    /// when nothing else is available and the per-key budget allows it.
-    fn plan_retry(
-        &self,
-        attempted: &HashSet<usize>,
-        same_key_retries: &mut HashMap<usize, usize>,
-        failed: &SelectedKey,
-        attempt: usize,
-        mode: FailoverMode,
-    ) -> RetryPlan {
-        if attempt >= self.retry.max_attempts {
-            return RetryPlan::Exhausted;
-        }
-        let (failed_group, pool_mode) = match mode {
-            FailoverMode::Any => (None, FailoverMode::Any),
-            FailoverMode::PreferOtherGroup => (
-                Some(failed.quota_group.as_ref()),
-                FailoverMode::PreferOtherGroup,
-            ),
-            FailoverMode::RequireOtherGroup => (
-                Some(failed.quota_group.as_ref()),
-                FailoverMode::RequireOtherGroup,
-            ),
-        };
-        if let Some(next) = self
-            .pool
-            .select_for_failover(attempted, failed_group, pool_mode)
-        {
-            return RetryPlan::Failover(next);
-        }
-        let used = same_key_retries.entry(failed.index).or_insert(0);
-        if *used < self.retry.max_same_key_retries {
-            *used += 1;
-            return RetryPlan::SameKey(backoff_duration(&self.retry, attempt, pseudo_jitter()));
-        }
-        RetryPlan::Exhausted
-    }
-
+    /// Dial one route with its own model in the request body.
     async fn send_once(
         &self,
-        selected: &SelectedKey,
+        target: &RouteTarget,
         body: Bytes,
         stream: bool,
         request_id: &str,
-        upstream_model: &str,
     ) -> std::result::Result<reqwest::Response, reqwest::Error> {
         let started = Instant::now();
         let accept = if stream {
@@ -983,7 +850,7 @@ impl Core {
             "application/json"
         };
         // Construct authorization last and never copy caller headers.
-        let authorization = format!("Bearer {}", selected.api_key());
+        let authorization = format!("Bearer {}", target.key.api_key());
         let mut request = self
             .http
             .post(self.messages_url.clone())
@@ -1002,7 +869,7 @@ impl Core {
         if let Ok(value) = HeaderValue::try_from(request_id) {
             request = request.header(HeaderName::from_static("x-request-id"), value);
         }
-        if let Ok(value) = HeaderValue::try_from(upstream_model) {
+        if let Ok(value) = HeaderValue::try_from(target.model_str()) {
             request = request.header(HeaderName::from_static("x-sensenova-proxy-model"), value);
         }
         let result = request
@@ -1012,8 +879,8 @@ impl Core {
         match &result {
             Ok(response) => tracing::info!(
                 request_id,
-                upstream_model,
-                credential = %selected.name,
+                model = target.model_str(),
+                credential = %target.key.name,
                 upstream_status = response.status().as_u16(),
                 duration_ms = started.elapsed().as_millis() as u64,
                 stream,
@@ -1021,8 +888,8 @@ impl Core {
             ),
             Err(error) => tracing::warn!(
                 request_id,
-                upstream_model,
-                credential = %selected.name,
+                model = target.model_str(),
+                credential = %target.key.name,
                 duration_ms = started.elapsed().as_millis() as u64,
                 error_class = transport_error_class(error),
                 stream,
@@ -1031,6 +898,269 @@ impl Core {
         }
         result
     }
+
+    /// Decide whether another route attempt is worth making.
+    ///
+    /// Returns `Some(wait)` to continue (after sleeping `wait`), or `None`
+    /// when the budget is spent or nothing is dialable. A same-route replay is
+    /// only ever allowed when the profile's `same_route_429_retries` budget
+    /// permits *and* no other healthy route exists.
+    #[allow(clippy::too_many_arguments)]
+    fn next_attempt(
+        &self,
+        spec: &RouteSpec,
+        metrics: &Metrics,
+        failed: &RouteTarget,
+        skipped: &mut HashSet<(u64, u64, usize)>,
+        same_route_retries: &mut usize,
+        attempt: usize,
+        session_tag: &str,
+        reason: &'static str,
+        detail: &'static str,
+        cooldown: Duration,
+        request_id: &str,
+    ) -> Option<Option<Duration>> {
+        if attempt >= self.max_route_attempts {
+            return None;
+        }
+        match self
+            .routes
+            .followup(spec, session_tag, failed, skipped, metrics)
+        {
+            Followup::Continue { wait, waitable } => {
+                metrics
+                    .retries_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .route_failovers_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    request_id,
+                    credential = %failed.key.name,
+                    quota_group = failed.quota_group_str(),
+                    model = failed.model_str(),
+                    attempt,
+                    retry_reason = reason,
+                    detail,
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    wait_ms = wait.as_millis() as u64,
+                    same_route_retry = false,
+                    hint_waitable = waitable,
+                    "pre-commit failure; failing over to the next route"
+                );
+                Some((wait > Duration::ZERO).then_some(wait))
+            }
+            Followup::Return => {
+                // Nothing healthy is dialable. A same-route replay is the last
+                // resort and is tightly bounded.
+                if *same_route_retries >= self.same_route_429_retries
+                    || cooldown > self.retry_after_max
+                {
+                    return None;
+                }
+                *same_route_retries += 1;
+                metrics
+                    .retries_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    request_id,
+                    credential = %failed.key.name,
+                    quota_group = failed.quota_group_str(),
+                    model = failed.model_str(),
+                    attempt,
+                    retry_reason = reason,
+                    detail,
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    same_route_retry = true,
+                    same_route_budget = self.same_route_429_retries,
+                    "no alternative route; waiting out the bounded cooldown on the same route"
+                );
+                Some(Some(cooldown))
+            }
+        }
+    }
+
+    /// Explicit quota exhaustion: only a different quota group may be tried.
+    #[allow(clippy::too_many_arguments)]
+    fn next_attempt_group(
+        &self,
+        spec: &RouteSpec,
+        metrics: &Metrics,
+        failed: &RouteTarget,
+        skipped: &mut HashSet<(u64, u64, usize)>,
+        attempt: usize,
+        session_tag: &str,
+        cooldown: Duration,
+        request_id: &str,
+    ) -> Option<Option<Duration>> {
+        if attempt >= self.max_route_attempts {
+            return None;
+        }
+        let mut probe = skipped.clone();
+        probe.insert(failed.identity());
+        // The failed group is fully cooled, so the planner will not return it;
+        // any plan therefore implies a different group (or model).
+        match self
+            .routes
+            .plan(spec, session_tag, attempt, &probe, metrics)
+        {
+            Ok(plan) if plan.target.quota_group_str() != failed.quota_group_str() => {
+                metrics
+                    .retries_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .cross_group_failovers_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .route_failovers_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    request_id,
+                    credential = %failed.key.name,
+                    quota_group = failed.quota_group_str(),
+                    model = failed.model_str(),
+                    attempt,
+                    next_model = plan.target.model_str(),
+                    next_quota_group = plan.target.quota_group_str(),
+                    cross_group_failover = true,
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    "quota exhaustion; failing over to another quota group"
+                );
+                Some(None)
+            }
+            _ => None,
+        }
+    }
+
+    /// 404: the model is disabled, so the next attempt must use another one.
+    #[allow(clippy::too_many_arguments)]
+    fn next_attempt_model(
+        &self,
+        spec: &RouteSpec,
+        metrics: &Metrics,
+        failed: &RouteTarget,
+        skipped: &mut HashSet<(u64, u64, usize)>,
+        attempt: usize,
+        session_tag: &str,
+        cooldown: Duration,
+        request_id: &str,
+    ) -> Option<Option<Duration>> {
+        if attempt >= self.max_route_attempts {
+            return None;
+        }
+        match self
+            .routes
+            .plan(spec, session_tag, attempt, skipped, metrics)
+        {
+            Ok(plan) if plan.target.model_str() != failed.model_str() => {
+                metrics
+                    .retries_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .model_failovers_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .cross_model_failovers_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    request_id,
+                    model = failed.model_str(),
+                    attempt,
+                    next_model = plan.target.model_str(),
+                    next_tier = plan.target.tier,
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    cross_model_failover = true,
+                    "model unavailable on this route; failing over to another model"
+                );
+                Some(None)
+            }
+            _ => None,
+        }
+    }
+
+    /// Build the client-facing failure when no route can be dialed at all.
+    fn route_unavailable(
+        &self,
+        waitable: crate::router::WaitablePlan,
+        request_id: &str,
+    ) -> GatewayError {
+        let wait = waitable
+            .wait
+            .map(|wait| cap_cooldown(wait, self.retry_after_max));
+        match wait {
+            Some(wait) => {
+                tracing::warn!(
+                    request_id,
+                    retry_after_ms = wait.as_millis() as u64,
+                    routes_inactive = self.routes.usable_route_count(),
+                    "no route is currently dialable; returning Retry-After"
+                );
+                GatewayError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    message: "all configured routes are cooling down; retry shortly".into(),
+                    class: UpstreamErrorClass::RateLimited,
+                    retry_after: Some(retry_after_for(wait)),
+                    sanitized_body: None,
+                }
+            }
+            None => {
+                tracing::error!(
+                    request_id,
+                    credentials = self.routes.credential_count(),
+                    "no usable route exists for the configured routing profiles"
+                );
+                GatewayError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: "no usable upstream route is configured for this model".into(),
+                    class: UpstreamErrorClass::Unknown,
+                    retry_after: None,
+                    sanitized_body: None,
+                }
+            }
+        }
+    }
+}
+
+/// Rewrite only the `model` field of a canonical request body.
+///
+/// The canonical body is never mutated, so every attempt can carry a
+/// different upstream model without risking a partial or double rewrite.
+fn rewrite_model(canonical: &Bytes, model: &str) -> std::result::Result<Bytes, GatewayError> {
+    let mut value: Value = serde_json::from_slice(canonical).map_err(|_| GatewayError {
+        status: StatusCode::BAD_REQUEST,
+        message: "request body could not be re-serialized for routing".into(),
+        class: UpstreamErrorClass::InvalidRequest,
+        retry_after: None,
+        sanitized_body: None,
+    })?;
+    match value.as_object_mut() {
+        Some(object) => {
+            object.insert("model".into(), Value::String(model.to_owned()));
+        }
+        None => {
+            return Err(GatewayError {
+                status: StatusCode::BAD_REQUEST,
+                message: "request body must be a JSON object".into(),
+                class: UpstreamErrorClass::InvalidRequest,
+                retry_after: None,
+                sanitized_body: None,
+            });
+        }
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|_| GatewayError {
+            status: StatusCode::BAD_REQUEST,
+            message: "request could not be serialized".into(),
+            class: UpstreamErrorClass::InvalidRequest,
+            retry_after: None,
+            sanitized_body: None,
+        })
+}
+
+/// Stable, bounded transport-error label for logs.
+fn error_class(error: &reqwest::Error) -> &'static str {
+    transport_error_class(error)
 }
 
 fn default_message_for_status(status: StatusCode) -> &'static str {
@@ -1070,23 +1200,6 @@ async fn read_limited(mut response: reqwest::Response, limit: usize) -> Bytes {
         }
     }
     Bytes::from(output)
-}
-
-/// Bounded exponential backoff with jitter: `initial << (attempt-1)` scaled by
-/// a jitter factor in [1.0, 1.5), capped at `backoff_max_ms`. Never sleeps
-/// indefinitely.
-pub fn backoff_duration(
-    retry: &crate::config::RetryConfig,
-    attempt: usize,
-    jitter: f64,
-) -> Duration {
-    let step = attempt.saturating_sub(1).min(4) as u32;
-    let initial = retry.backoff_initial_ms as u128;
-    let max = retry.backoff_max_ms as u128;
-    let base = initial.saturating_mul(1u128 << step).min(max);
-    let jitter = jitter.clamp(0.0, 1.0);
-    let value = base as f64 * (1.0 + 0.5 * jitter);
-    Duration::from_millis((value as u128).min(max) as u64)
 }
 
 fn pseudo_jitter() -> f64 {

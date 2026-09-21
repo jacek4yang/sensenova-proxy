@@ -20,6 +20,19 @@ pub mod defaults {
     pub const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
     pub const SHUTDOWN_TIMEOUT_SECS: u64 = 30;
     pub const STREAM_PING_SECS: u64 = 15;
+    pub const MAX_ROUTE_ATTEMPTS: usize = 4;
+    pub const SOFT_AFFINITY_SECS: u64 = 300;
+    pub const MAX_AFFINITY_ENTRIES: usize = 4_096;
+    pub const SAME_ROUTE_429_RETRIES: usize = 0;
+    pub const ROUTE_COOLDOWN_INITIAL_SECS: u64 = 10;
+    pub const ROUTE_COOLDOWN_MAX_SECS: u64 = 120;
+    pub const MODEL_TRIP_DISTINCT_GROUPS: usize = 2;
+    pub const MODEL_TRIP_WINDOW_SECS: u64 = 20;
+    pub const MODEL_OPEN_SECS: u64 = 30;
+    pub const RETRY_AFTER_MAX_SECS: u64 = 120;
+    pub const MAX_MODEL_COOLDOWN_SECS: u64 = 86_400;
+    pub const HARD_PROFILE: &str = "claude-coding-hard";
+    pub const FAST_PROFILE: &str = "claude-coding-fast";
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -29,6 +42,7 @@ pub struct Config {
     pub upstream: UpstreamConfig,
     pub sensenova_api_keys: Vec<SensenovaKeyConfig>,
     pub models: ModelsConfig,
+    pub routing: RoutingConfig,
     pub retry: RetryConfig,
     pub concurrency: ConcurrencyConfig,
     pub circuit: CircuitConfig,
@@ -127,6 +141,122 @@ impl Default for ModelsConfig {
             aliases: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// Virtual-model routing configuration.
+///
+/// Routing chain: client model → profile → quality tier → upstream model →
+/// quota group → API key. A profile without any tier disables routing for
+/// that name and the request falls back to the legacy
+/// `models.default` / `models.aliases` behaviour.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutingConfig {
+    /// One global route-attempt budget per logical request. Quality-tier
+    /// fallback, quota-group failover, key failover and same-route replay all
+    /// draw from this single number.
+    pub max_route_attempts: usize,
+    /// TTL of the weak behavioural session affinity (never cache-driven).
+    pub soft_affinity_secs: u64,
+    /// Hard bound on remembered sessions so affinity cannot grow without
+    /// limit.
+    pub max_affinity_entries: usize,
+    /// Replays of the exact same `(model, quota_group, key)` after a 429.
+    /// Zero means: always try another healthy route first.
+    pub same_route_429_retries: usize,
+    pub route_cooldown_initial_secs: u64,
+    pub route_cooldown_max_secs: u64,
+    /// Distinct quota groups that must fail inside `model_trip_window_secs`
+    /// before a model-wide circuit opens. `2` means one account can never
+    /// disable a model by itself.
+    pub model_trip_distinct_groups: usize,
+    pub model_trip_window_secs: u64,
+    /// How long a tripped model circuit stays open before a half-open probe.
+    pub model_open_secs: u64,
+    /// Longest cooldown the proxy will wait out inside one request before
+    /// returning `Retry-After` to the client instead.
+    pub retry_after_max_secs: u64,
+    /// Upper bound for a route/model cooldown (also caps parsed hints).
+    pub max_model_cooldown_secs: u64,
+    pub profiles: Profiles,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            max_route_attempts: defaults::MAX_ROUTE_ATTEMPTS,
+            soft_affinity_secs: defaults::SOFT_AFFINITY_SECS,
+            max_affinity_entries: defaults::MAX_AFFINITY_ENTRIES,
+            same_route_429_retries: defaults::SAME_ROUTE_429_RETRIES,
+            route_cooldown_initial_secs: defaults::ROUTE_COOLDOWN_INITIAL_SECS,
+            route_cooldown_max_secs: defaults::ROUTE_COOLDOWN_MAX_SECS,
+            model_trip_distinct_groups: defaults::MODEL_TRIP_DISTINCT_GROUPS,
+            model_trip_window_secs: defaults::MODEL_TRIP_WINDOW_SECS,
+            model_open_secs: defaults::MODEL_OPEN_SECS,
+            retry_after_max_secs: defaults::RETRY_AFTER_MAX_SECS,
+            max_model_cooldown_secs: defaults::MAX_MODEL_COOLDOWN_SECS,
+            profiles: builtin_profiles(),
+        }
+    }
+}
+
+/// The documented default profiles.
+///
+/// `claude-coding-hard` isolates quality: tier 0 (`glm-5.2`,
+/// `deepseek-v4-pro`) always outranks tier 1 (`kimi-k3`), and neither
+/// `deepseek-v4-flash` nor `sensenova-6.8-flash-lite` can ever be selected.
+/// `claude-coding-fast` contains only latency-oriented models.
+pub fn builtin_profiles() -> Profiles {
+    let mut profiles = Profiles::new();
+    profiles.insert(
+        defaults::HARD_PROFILE.to_owned(),
+        ProfileConfig {
+            latency_optimized: false,
+            allow_cross_tier_fallback: false,
+            tiers: vec![
+                TierConfig {
+                    models: vec!["glm-5.2".into(), "deepseek-v4-pro".into()],
+                },
+                TierConfig {
+                    models: vec!["kimi-k3".into()],
+                },
+            ],
+        },
+    );
+    profiles.insert(
+        defaults::FAST_PROFILE.to_owned(),
+        ProfileConfig {
+            latency_optimized: true,
+            allow_cross_tier_fallback: false,
+            tiers: vec![TierConfig {
+                models: vec![
+                    "deepseek-v4-flash".into(),
+                    "sensenova-6.8-flash-lite".into(),
+                ],
+            }],
+        },
+    );
+    profiles
+}
+
+pub type Profiles = std::collections::BTreeMap<String, ProfileConfig>;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileConfig {
+    /// Fast profiles score candidates by observed TTFT/latency; hard profiles
+    /// only use health and load inside the same quality tier.
+    pub latency_optimized: bool,
+    /// When false (the default, and mandatory for the hard profile) a failing
+    /// tier never falls through to a weaker model: the proxy fails honestly.
+    pub allow_cross_tier_fallback: bool,
+    pub tiers: Vec<TierConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TierConfig {
+    pub models: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -376,8 +506,91 @@ impl Config {
         if self.runtime.max_request_bytes == 0 || self.runtime.shutdown_timeout_secs == 0 {
             bail!("runtime size and shutdown limits must be greater than zero");
         }
+        self.validate_routing()?;
         tracing_subscriber::EnvFilter::try_new(&self.runtime.log_level)
             .context("runtime.log_level must be a valid tracing filter")?;
+        Ok(())
+    }
+
+    /// Validate the routing section, reporting problems by profile/tier index
+    /// so no configuration value (and never a credential) is echoed.
+    fn validate_routing(&self) -> Result<()> {
+        let routing = &self.routing;
+        if routing.max_route_attempts == 0 || routing.max_route_attempts > 8 {
+            bail!("routing.max_route_attempts must be between 1 and 8");
+        }
+        if routing.soft_affinity_secs > 86_400 {
+            bail!("routing.soft_affinity_secs must not exceed 86400");
+        }
+        if routing.max_affinity_entries == 0 || routing.max_affinity_entries > 1_000_000 {
+            bail!("routing.max_affinity_entries must be between 1 and 1000000");
+        }
+        if routing.same_route_429_retries > 3 {
+            bail!("routing.same_route_429_retries must be between 0 and 3");
+        }
+        if routing.route_cooldown_initial_secs == 0
+            || routing.route_cooldown_max_secs == 0
+            || routing.route_cooldown_initial_secs > routing.route_cooldown_max_secs
+            || routing.route_cooldown_max_secs > 3_600
+        {
+            bail!("routing.route_cooldown_* must satisfy 1 <= initial <= max <= 3600 seconds");
+        }
+        if routing.model_trip_distinct_groups == 0 || routing.model_trip_distinct_groups > 16 {
+            bail!(
+                "routing.model_trip_distinct_groups must be between 1 and 16 \
+                 (2 means one account can never disable a model)"
+            );
+        }
+        if routing.model_trip_window_secs == 0 || routing.model_trip_window_secs > 3_600 {
+            bail!("routing.model_trip_window_secs must be between 1 and 3600");
+        }
+        if routing.model_open_secs == 0 || routing.model_open_secs > 3_600 {
+            bail!("routing.model_open_secs must be between 1 and 3600");
+        }
+        if routing.retry_after_max_secs == 0 || routing.retry_after_max_secs > 3_600 {
+            bail!("routing.retry_after_max_secs must be between 1 and 3600");
+        }
+        if routing.max_model_cooldown_secs == 0
+            || routing.max_model_cooldown_secs > 366 * 24 * 3_600
+        {
+            bail!("routing.max_model_cooldown_secs must be between 1 and one year");
+        }
+
+        if routing.profiles.is_empty() {
+            // Absent profiles fall back to the built-in hard/fast pair.
+            return Ok(());
+        }
+        for (name, profile) in &routing.profiles {
+            if name.trim().is_empty() {
+                bail!("routing.profiles keys must not be empty");
+            }
+            if profile.tiers.is_empty() {
+                bail!("routing.profiles.{name}.tiers must not be empty");
+            }
+            if profile.allow_cross_tier_fallback && profile.tiers.len() < 2 {
+                bail!(
+                    "routing.profiles.{name}.allow_cross_tier_fallback is meaningless with a single tier"
+                );
+            }
+            let mut seen: HashSet<&str> = HashSet::new();
+            for (index, tier) in profile.tiers.iter().enumerate() {
+                if tier.models.is_empty() {
+                    bail!("routing.profiles.{name}.tiers[{index}].models must not be empty");
+                }
+                for model in &tier.models {
+                    if model.trim().is_empty() {
+                        bail!(
+                            "routing.profiles.{name}.tiers[{index}].models entries must not be empty"
+                        );
+                    }
+                    if !seen.insert(model.as_str()) {
+                        bail!(
+                            "routing.profiles.{name}: model '{model}' appears in more than one tier"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -388,6 +601,29 @@ impl Config {
             self.upstream.messages_path.as_str()
         ))
         .context("building SenseNova messages URL")
+    }
+
+    /// Routing profiles actually in force: the configured ones when present,
+    /// otherwise the documented built-in hard/fast profiles.
+    pub fn profiles(&self) -> Profiles {
+        if self.routing.profiles.is_empty() {
+            builtin_profiles()
+        } else {
+            self.routing.profiles.clone()
+        }
+    }
+
+    /// Routing tunables as used by the router, with the documented defaults
+    /// backfilled when the section (or a field) is absent.
+    pub fn route_config(&self) -> crate::router::RouteConfig {
+        crate::router::RouteConfig::from(&self.routing)
+    }
+
+    /// The routing profile a request that names no virtual model is routed
+    /// through. The hard profile is deliberate: an unqualified Claude Code
+    /// request gets the quality pool, never the fast one.
+    pub fn default_profile(&self) -> String {
+        defaults::HARD_PROFILE.to_owned()
     }
 
     pub fn binds_loopback(&self) -> bool {
@@ -518,6 +754,222 @@ mod tests {
             config.models.aliases["claude-sensenova"],
             config.models.default
         );
+    }
+
+    #[test]
+    fn example_routing_section_is_valid_and_documented() {
+        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.json"));
+        let config = Config::load(path).expect("example configuration must remain valid");
+        let profiles = config.profiles();
+        assert!(profiles.contains_key("claude-coding-hard"));
+        assert!(profiles.contains_key("claude-coding-fast"));
+        let hard = &profiles["claude-coding-hard"];
+        assert_eq!(
+            hard.tiers.len(),
+            2,
+            "hard has a quality tier and a fallback"
+        );
+        assert_eq!(hard.tiers[0].models, vec!["glm-5.2", "deepseek-v4-pro"]);
+        assert_eq!(hard.tiers[1].models, vec!["kimi-k3"]);
+        assert!(
+            !hard.allow_cross_tier_fallback,
+            "the hard profile must never degrade silently"
+        );
+        let fast = &profiles["claude-coding-fast"];
+        assert!(fast.latency_optimized);
+        assert_eq!(fast.tiers.len(), 1);
+        assert_eq!(
+            fast.tiers[0].models,
+            vec!["deepseek-v4-flash", "sensenova-6.8-flash-lite"]
+        );
+        // The aliases route Claude Code's model names at the profiles.
+        assert_eq!(
+            config.models.aliases["claude-sonnet-4-5"],
+            "claude-coding-hard"
+        );
+        assert_eq!(
+            config.models.aliases["claude-haiku-4-5"],
+            "claude-coding-fast"
+        );
+    }
+
+    #[test]
+    fn builtin_profiles_isolate_quality() {
+        let profiles = builtin_profiles();
+        let hard = &profiles[defaults::HARD_PROFILE];
+        let fast = &profiles[defaults::FAST_PROFILE];
+        let hard_models: Vec<&String> = hard
+            .tiers
+            .iter()
+            .flat_map(|tier| tier.models.iter())
+            .collect();
+        let fast_models: Vec<&String> = fast
+            .tiers
+            .iter()
+            .flat_map(|tier| tier.models.iter())
+            .collect();
+        // No overlap at all: a fast model can never appear in the hard pool.
+        for model in &fast_models {
+            assert!(
+                !hard_models.contains(model),
+                "{model} must not be in the hard pool"
+            );
+        }
+        assert!(!hard.allow_cross_tier_fallback);
+        assert!(fast.latency_optimized);
+    }
+
+    #[test]
+    fn routing_bounds_are_validated_without_leaking_values() {
+        for mutate in [
+            |routing: &mut RoutingConfig| routing.max_route_attempts = 0,
+            |routing: &mut RoutingConfig| routing.max_route_attempts = 99,
+            |routing: &mut RoutingConfig| routing.route_cooldown_initial_secs = 0,
+            |routing: &mut RoutingConfig| routing.route_cooldown_initial_secs = 600,
+            |routing: &mut RoutingConfig| routing.route_cooldown_max_secs = 0,
+            |routing: &mut RoutingConfig| routing.model_trip_distinct_groups = 0,
+            |routing: &mut RoutingConfig| routing.model_trip_window_secs = 0,
+            |routing: &mut RoutingConfig| routing.model_open_secs = 0,
+            |routing: &mut RoutingConfig| routing.retry_after_max_secs = 0,
+            |routing: &mut RoutingConfig| routing.max_model_cooldown_secs = 0,
+            |routing: &mut RoutingConfig| routing.max_affinity_entries = 0,
+            |routing: &mut RoutingConfig| routing.soft_affinity_secs = 999_999,
+            |routing: &mut RoutingConfig| routing.same_route_429_retries = 9,
+            |routing: &mut RoutingConfig| routing.model_trip_distinct_groups = 99,
+        ] {
+            let mut config = valid_config();
+            mutate(&mut config.routing);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("routing."), "unexpected error: {error}");
+            // Validation messages name the field, never a value.
+            assert!(!error.contains("sensenova-secret"));
+            assert!(!error.contains("gateway-secret"));
+        }
+    }
+
+    #[test]
+    fn routing_profiles_are_validated() {
+        // Empty tier list.
+        let mut config = valid_config();
+        config.routing.profiles.insert(
+            "broken".into(),
+            ProfileConfig {
+                latency_optimized: false,
+                allow_cross_tier_fallback: false,
+                tiers: Vec::new(),
+            },
+        );
+        assert!(config.validate().is_err());
+
+        // Empty model list inside a tier.
+        let mut config = valid_config();
+        config.routing.profiles.insert(
+            "broken".into(),
+            ProfileConfig {
+                latency_optimized: false,
+                allow_cross_tier_fallback: false,
+                tiers: vec![TierConfig { models: Vec::new() }],
+            },
+        );
+        assert!(config.validate().is_err());
+
+        // The same model in two tiers is ambiguous and rejected.
+        let mut config = valid_config();
+        config.routing.profiles.insert(
+            "broken".into(),
+            ProfileConfig {
+                latency_optimized: false,
+                allow_cross_tier_fallback: true,
+                tiers: vec![
+                    TierConfig {
+                        models: vec!["dupe".into()],
+                    },
+                    TierConfig {
+                        models: vec!["dupe".into()],
+                    },
+                ],
+            },
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("more than one tier"));
+
+        // Cross-tier fallback with a single tier is meaningless.
+        let mut config = valid_config();
+        config.routing.profiles.insert(
+            "broken".into(),
+            ProfileConfig {
+                latency_optimized: false,
+                allow_cross_tier_fallback: true,
+                tiers: vec![TierConfig {
+                    models: vec!["only".into()],
+                }],
+            },
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn routing_section_rejects_unknown_fields() {
+        let parsed: std::result::Result<Config, _> =
+            serde_json::from_str(r#"{"routing":{"no_such_field":1}}"#);
+        assert!(parsed.is_err(), "unknown routing fields must be rejected");
+        let parsed: std::result::Result<Config, _> =
+            serde_json::from_str(r#"{"routing":{"profiles":{"p":{"tiers":[],"extra":1}}}}"#);
+        assert!(parsed.is_err(), "unknown profile fields must be rejected");
+    }
+
+    #[test]
+    fn absent_routing_section_falls_back_to_builtin_profiles() {
+        // Backward compatibility: an old configuration with no `routing`
+        // section keeps working and gets the documented defaults.
+        let config = Config::default();
+        assert_eq!(
+            config.routing.max_route_attempts,
+            defaults::MAX_ROUTE_ATTEMPTS
+        );
+        assert_eq!(
+            config.routing.soft_affinity_secs,
+            defaults::SOFT_AFFINITY_SECS
+        );
+        assert_eq!(
+            config.routing.same_route_429_retries,
+            defaults::SAME_ROUTE_429_RETRIES
+        );
+        let profiles = config.profiles();
+        assert_eq!(profiles.len(), 2);
+        let route = config.route_config();
+        assert_eq!(route.max_route_attempts, defaults::MAX_ROUTE_ATTEMPTS);
+        assert_eq!(
+            route.route_cooldown_initial,
+            std::time::Duration::from_secs(defaults::ROUTE_COOLDOWN_INITIAL_SECS)
+        );
+        assert_eq!(
+            route.route_cooldown_max,
+            std::time::Duration::from_secs(defaults::ROUTE_COOLDOWN_MAX_SECS)
+        );
+        assert_eq!(config.default_profile(), defaults::HARD_PROFILE);
+    }
+
+    #[test]
+    fn explicit_profiles_replace_the_builtin_pair() {
+        let mut config = valid_config();
+        let mut profiles = Profiles::new();
+        profiles.insert(
+            "solo".into(),
+            ProfileConfig {
+                latency_optimized: true,
+                allow_cross_tier_fallback: false,
+                tiers: vec![TierConfig {
+                    models: vec!["one-model".into()],
+                }],
+            },
+        );
+        config.routing.profiles = profiles;
+        config.validate().unwrap();
+        let resolved = config.profiles();
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved.contains_key("solo"));
+        assert!(!resolved.contains_key(defaults::HARD_PROFILE));
     }
 
     #[test]

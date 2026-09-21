@@ -129,8 +129,16 @@ fallback is ever added; sensenova-proxy v1 does not use this path).
   group and the same request immediately fails over to another group;
   generic 429 / stream-EOF / 5xx failovers prefer a different group (likely
   a different serving domain) with same-group siblings as fallback; 401/403
-  stay credential-specific. All failover remains bounded by
-  `retry.max_attempts`.
+  stay credential-specific. All failover remains bounded by the single global
+  route-attempt budget (`routing.max_route_attempts`).
+- Model routing is **proxy policy, not upstream behaviour**: which catalog
+  model answers a given request, in which tier order, under which cooldown, is
+  decided entirely by this proxy (see [`routing.md`](routing.md)). The only
+  upstream facts it relies on are the ones in this document — the observed
+  catalog IDs (`glm-5.2`, `deepseek-v4-pro`, `kimi-k3`, `deepseek-v4-flash`,
+  `sensenova-6.8-flash-lite`), that all of them are served natively on
+  `/v1/messages`, and that a bare HTTP 429 without explicit quota wording is
+  ordinary rate limiting rather than credit exhaustion.
 - Authoritative quota querying: **intentionally not implemented.** The
   logged-in dashboard reads live pool data from control-plane endpoints
   discovered in the console JavaScript bundle

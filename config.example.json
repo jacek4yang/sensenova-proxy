@@ -24,9 +24,37 @@
     "map_unknown_to_default": true,
     "aliases": {
       "claude-sensenova": "sensenova-6.8-flash-lite",
-      "claude-sonnet-4-5": "sensenova-6.8-flash-lite",
-      "claude-haiku-4-5": "sensenova-6.8-flash-lite",
+      "claude-sonnet-4-5": "claude-coding-hard",
+      "claude-haiku-4-5": "claude-coding-fast",
       "claude-deepseek": "deepseek-v4-pro"
+    }
+  },
+  "routing": {
+    "max_route_attempts": 4,
+    "soft_affinity_secs": 300,
+    "max_affinity_entries": 4096,
+    "same_route_429_retries": 0,
+    "route_cooldown_initial_secs": 10,
+    "route_cooldown_max_secs": 120,
+    "model_trip_distinct_groups": 2,
+    "model_trip_window_secs": 20,
+    "model_open_secs": 30,
+    "retry_after_max_secs": 120,
+    "max_model_cooldown_secs": 86400,
+    "profiles": {
+      "claude-coding-hard": {
+        "latency_optimized": false,
+        "allow_cross_tier_fallback": false,
+        "tiers": [
+          { "models": ["glm-5.2", "deepseek-v4-pro"] },
+          { "models": ["kimi-k3"] }
+        ]
+      },
+      "claude-coding-fast": {
+        "latency_optimized": true,
+        "allow_cross_tier_fallback": false,
+        "tiers": [{ "models": ["deepseek-v4-flash", "sensenova-6.8-flash-lite"] }]
+      }
     }
   },
   "retry": {
