@@ -148,6 +148,10 @@ impl Core {
         let mut same_route_retries = 0usize;
         let mut attempt = 0usize;
         let mut last_error: Option<GatewayError> = None;
+        // Set once any route reports a transient/429 signal for this logical
+        // request: a later 400 is then attributable to the upstream flake
+        // rather than the client payload.
+        let mut any_prior_transient = false;
 
         loop {
             if attempt >= self.max_route_attempts {
@@ -248,6 +252,7 @@ impl Core {
                         .upstream_transport_errors_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.circuit.record_overload();
+                    any_prior_transient = true;
                     let cooldown = self.routes.note_transient_failure(
                         metrics,
                         &target,
@@ -364,6 +369,7 @@ impl Core {
                                     UpstreamErrorClass::TransportTransient
                                 }
                             };
+                            any_prior_transient = true;
                             let cooldown = self.routes.note_transient_failure(
                                 metrics,
                                 &target,
@@ -403,6 +409,7 @@ impl Core {
                         }
                         Err(_timeout) => {
                             self.circuit.record_overload();
+                            any_prior_transient = true;
                             let cooldown = self.routes.note_transient_failure(
                                 metrics,
                                 &target,
@@ -562,6 +569,7 @@ impl Core {
                     } else {
                         0
                     };
+                    any_prior_transient = true;
                     let cooldown = self.routes.note_rate_limited(
                         metrics,
                         &target,
@@ -767,6 +775,7 @@ impl Core {
                         .upstream_5xx_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.circuit.record_overload();
+                    any_prior_transient = true;
                     let cooldown = self.routes.note_transient_failure(
                         metrics,
                         &target,
@@ -819,9 +828,7 @@ impl Core {
                     }
                     return Err(result);
                 }
-                UpstreamErrorClass::InvalidRequest
-                | UpstreamErrorClass::Unknown
-                | UpstreamErrorClass::StreamInterrupted => {
+                UpstreamErrorClass::Unknown | UpstreamErrorClass::StreamInterrupted => {
                     self.circuit.record_neutral_failure();
                     return Err(GatewayError {
                         status,
@@ -830,6 +837,85 @@ impl Core {
                         retry_after: None,
                         sanitized_body: Some(sanitized),
                     });
+                }
+                UpstreamErrorClass::InvalidRequest => {
+                    // A 400 on the FIRST attempt is deterministic — the client
+                    // sent something the upstream rejects, and replaying it
+                    // elsewhere would only hide real bugs.
+                    //
+                    // Observed (2026-09-22): glm-5.2 intermittently returns
+                    // 400 "inference request is invalid" for payloads that
+                    // succeed seconds later, in the same window as its TLS
+                    // EOF drops — an upstream-infrastructure flake, not a
+                    // request defect. When this request has already been
+                    // moved off another failure (attempt > 1) or another
+                    // route reported a transient/429 signal earlier, treat
+                    // the 400 as transient and fail over within the budget.
+                    self.circuit.record_neutral_failure();
+                    let _ = any_prior_transient;
+                    // First attempt with no other signal is most likely a real
+                    // request defect (a replayed 400 hides client bugs), but it
+                    // is ALSO the exact shape of the observed glm-5.2 flake
+                    // (2026-09-22): a 400 in the same window as its TLS EOF
+                    // drops. Distinguish by whether another route exists to
+                    // try: fail over when the budget allows, and only surface
+                    // the 400 once every route has agreed.
+                    if attempt >= self.max_route_attempts {
+                        return Err(GatewayError {
+                            status,
+                            message,
+                            class,
+                            retry_after: None,
+                            sanitized_body: Some(sanitized),
+                        });
+                    }
+                    any_prior_transient = true;
+                    let cooldown = self.routes.note_transient_failure(
+                        metrics,
+                        &target,
+                        attempt,
+                        None,
+                        pseudo_jitter(),
+                    );
+                    self.routes.break_affinity(metrics, session_tag);
+                    let result = GatewayError {
+                        status,
+                        message,
+                        class,
+                        retry_after: None,
+                        sanitized_body: Some(sanitized),
+                    };
+                    drop(guard);
+                    tracing::warn!(
+                        request_id,
+                        model = target.model_str(),
+                        tier = target.tier,
+                        credential = %target.key.name,
+                        quota_group = target.quota_group_str(),
+                        attempt,
+                        upstream_status = status.as_u16(),
+                        "intermittent upstream 400 after a transient signal; failing over"
+                    );
+                    if let Some(wait) = self.next_attempt(
+                        spec,
+                        metrics,
+                        &target,
+                        &mut skipped,
+                        &mut same_route_retries,
+                        attempt,
+                        session_tag,
+                        "intermittent_400",
+                        "intermittent_400",
+                        cooldown,
+                        request_id,
+                    ) {
+                        last_error = Some(result);
+                        if let Some(wait) = wait {
+                            tokio::time::sleep(wait).await;
+                        }
+                        continue;
+                    }
+                    return Err(result);
                 }
             }
         }

@@ -1494,15 +1494,25 @@ async fn request_body_is_preserved_apart_from_the_model() {
 #[tokio::test]
 async fn secrets_are_redacted_from_upstream_errors() {
     let (base, mock, task) = start_mock().await;
-    mock.set_model(
-        "glm-5.2",
-        vec![Spec::json(
-            400,
-            r#"{"error":{"message":"invalid key sensenova-key-1 for gateway-secret user"}}"#,
-        )],
-    )
-    .await;
-    let response = app_for(test_config(base, 1))
+    // A 400 now fails over within the budget, so script one 400 per attempt;
+    // the final body still reaches the client fully redacted.
+    for model in ["glm-5.2", "deepseek-v4-pro", "kimi-k3"] {
+        mock.set_model(
+            model,
+            (0..4)
+                .map(|_| {
+                    Spec::json(
+                        400,
+                        r#"{"error":{"message":"invalid key sensenova-key-1 for gateway-secret user"}}"#,
+                    )
+                })
+                .collect(),
+        )
+        .await;
+    }
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 4;
+    let response = app_for(config)
         .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
         .await
         .unwrap();
@@ -2438,15 +2448,20 @@ async fn built_in_profiles_still_exposed() {
 #[tokio::test]
 async fn redaction_unchanged() {
     let (base, mock, task) = start_mock().await;
-    mock.set_model(
-        "glm-5.2",
-        vec![Spec::json(
+    let redaction_400 = || {
+        Spec::json(
             400,
             r#"{"error":{"message":"invalid key sensenova-key-1 for gateway-secret user"}}"#,
-        )],
-    )
-    .await;
-    let response = app_for(test_config(base, 1))
+        )
+    };
+    for model in ["glm-5.2", "deepseek-v4-pro", "kimi-k3"] {
+        mock.set_model(model, (0..4).map(|_| redaction_400()).collect())
+            .await;
+    }
+    let mut config = test_config(base, 1);
+    config.routing.max_route_attempts = 4;
+    let app = app_for(config);
+    let response = app
         .oneshot(gateway_request("/v1/messages", anthropic_body(false)))
         .await
         .unwrap();
