@@ -128,9 +128,8 @@ pub fn insert_approximate_header(headers: &mut HeaderMap) {
 }
 
 /// Rewrite the model (and inject a default `max_tokens` when absent) on an
-/// Anthropic Messages request body. This is the proxy's entire request
-/// transformation: everything else passes through unchanged (observed to be
-/// tolerated by SenseNova).
+/// Anthropic Messages request body, then apply the observed upstream
+/// compatibility fixups. Everything else passes through unchanged.
 pub fn normalize_messages_request(
     body: &mut Value,
     upstream_model: &str,
@@ -167,7 +166,34 @@ pub fn normalize_messages_request(
     {
         return Err(ProtocolError::invalid("stream must be a boolean"));
     }
+    if let Some(thinking) = object.get_mut("thinking") {
+        adapt_thinking_for_model(thinking, upstream_model);
+    }
     Ok(())
+}
+
+/// Observed upstream quirk (2026-09-22): `glm-5.2` rejects
+/// `thinking: {"type":"adaptive"}` with HTTP 400 "inference request is
+/// invalid", while `deepseek-v4-pro` / `kimi-k3` accept it and every model
+/// accepts `{"type":"disabled"}` and `{"type":"enabled","budget_tokens":…}`.
+///
+/// Adaptive means "the model decides", so downgrading to explicit
+/// `disabled` on `glm-5.2` is the safe, semantics-preserving fallback: the
+/// request succeeds and no unsolicited thinking blocks are produced.
+/// Everything else (including `display` and unknown extensions) is forwarded
+/// untouched — the 400 comes from the `adaptive` type itself, not the extra
+/// keys, and other models tolerate them.
+fn adapt_thinking_for_model(thinking: &mut Value, upstream_model: &str) {
+    if upstream_model != "glm-5.2" {
+        return;
+    }
+    let is_adaptive = thinking
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "adaptive");
+    if is_adaptive && let Some(object) = thinking.as_object_mut() {
+        object.insert("type".into(), Value::String("disabled".into()));
+    }
 }
 
 /// Extract the requested model and stream flag for logging/routing.
@@ -200,6 +226,44 @@ mod tests {
             .aliases
             .insert("claude-sensenova".into(), "sensenova-6.8-flash-lite".into());
         config
+    }
+
+    #[test]
+    fn glm_adaptive_thinking_is_downgraded_to_disabled() {
+        let mut body = json!({
+            "model": "claude-coding-hard",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive", "display": "omitted"}
+        });
+        normalize_messages_request(&mut body, "glm-5.2").unwrap();
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(
+            body["thinking"]["display"], "omitted",
+            "extra keys are preserved"
+        );
+
+        // Other models keep adaptive untouched.
+        let mut body = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"}
+        });
+        normalize_messages_request(&mut body, "deepseek-v4-pro").unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
+
+        // Explicit enabled passes through everywhere.
+        let mut body = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 1024}
+        });
+        normalize_messages_request(&mut body, "glm-5.2").unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+
+        // No thinking field: nothing is injected.
+        let mut body = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+        normalize_messages_request(&mut body, "glm-5.2").unwrap();
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]
