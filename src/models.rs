@@ -169,7 +169,68 @@ pub fn normalize_messages_request(
     if let Some(thinking) = object.get_mut("thinking") {
         adapt_thinking_for_model(thinking, upstream_model);
     }
+    // Observed upstream quirk (2026-09-22): `output_config` with a structured
+    // `format` (Claude Code's session-title call) is rejected with HTTP 400
+    // "inference request is invalid" by the fast models. The proxy never
+    // commits to a structured-output contract, so the whole field is a
+    // client-side hint and is dropped.
+    object.remove("output_config");
+    fold_system_messages(object);
     Ok(())
+}
+
+/// Observed Claude Code 2.1.270 behaviour (2026-09-22): it can emit
+/// `{"role":"system", "content":[...]}` *inside* the `messages` array. That
+/// role is not part of the Anthropic Messages schema, and SenseNova rejects
+/// such requests with HTTP 400 "inference request is invalid".
+///
+/// The system-role messages are folded into the top-level `system` field —
+/// the canonical way to carry system context — preserving block order: the
+/// existing system blocks come first, then each folded message's text blocks
+/// (cache_control markers preserved as-is).
+fn fold_system_messages(object: &mut serde_json::Map<String, Value>) {
+    use serde_json::json;
+
+    let has_system_message = object
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        });
+    if !has_system_message {
+        return;
+    }
+
+    let mut system_blocks: Vec<Value> = match object.get_mut("system") {
+        Some(Value::Array(blocks)) => blocks.clone(),
+        Some(Value::String(text)) => {
+            vec![json!({"type": "text", "text": text.clone()})]
+        }
+        _ => Vec::new(),
+    };
+    let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut carried: Vec<Value> = Vec::with_capacity(messages.len());
+    for message in messages.drain(..) {
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            match message.get("content") {
+                Some(Value::Array(blocks)) => system_blocks.extend(blocks.iter().cloned()),
+                Some(Value::String(text)) => {
+                    system_blocks.push(json!({"type": "text", "text": text.clone()}))
+                }
+                _ => {}
+            }
+        } else {
+            carried.push(message);
+        }
+    }
+    *messages = carried;
+    if !system_blocks.is_empty() {
+        object.insert("system".into(), Value::Array(system_blocks));
+    }
 }
 
 /// Observed upstream quirk (2026-09-22): `glm-5.2` rejects
@@ -264,6 +325,80 @@ mod tests {
         let mut body = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
         normalize_messages_request(&mut body, "glm-5.2").unwrap();
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn system_role_messages_are_folded_into_the_system_field() {
+        // Claude Code 2.1.270 can emit a system-role message inside `messages`;
+        // SenseNova rejects it with 400. It must be folded into `system`.
+        let mut body = json!({
+            "model": "x",
+            "system": [{"type": "text", "text": "base"}],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": [{"type": "text", "text": "extra context"}]},
+                {"role": "assistant", "content": "hello"}
+            ]
+        });
+        normalize_messages_request(&mut body, "glm-5.2").unwrap();
+        let system = body["system"].as_array().unwrap();
+        let texts: Vec<&str> = system
+            .iter()
+            .map(|block| block["text"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["base", "extra context"],
+            "folded after existing"
+        );
+        // The system-role message is gone; user and assistant remain in order.
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant"]);
+
+        // String-content system message folds too.
+        let mut body = json!({
+            "model": "x",
+            "messages": [
+                {"role": "system", "content": "inline"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        normalize_messages_request(&mut body, "glm-5.2").unwrap();
+        assert_eq!(body["system"][0]["text"], "inline");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+
+        // No system-role message: `system` untouched, messages unchanged.
+        let mut body = json!({
+            "model": "x",
+            "system": "keep",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        normalize_messages_request(&mut body, "glm-5.2").unwrap();
+        assert_eq!(body["system"], "keep");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn output_config_is_dropped() {
+        // Claude Code's structured-output hint is rejected by the upstream
+        // fast models; the proxy never honours it, so drop the field.
+        let mut body = json!({
+            "model": "x",
+            "output_config": {"effort": "high", "format": {"type": "json_schema"}},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        normalize_messages_request(&mut body, "deepseek-v4-flash").unwrap();
+        assert!(body.get("output_config").is_none());
+
+        // Absent stays absent; no error on models without the quirk either.
+        let mut body = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+        normalize_messages_request(&mut body, "glm-5.2").unwrap();
+        assert!(body.get("output_config").is_none());
     }
 
     #[test]
